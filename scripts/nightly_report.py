@@ -30,11 +30,9 @@ BASELINE_RATIO_ALERT = 0.80  # tileops slower than baseline by >25%
 HISTORY_RETENTION_DAYS = 14
 BENCH_PROVENANCE_KEYS = (
     "timing",
+    "cupti_attribution",
     "cupti_sampled_calls",
     "cupti_expected_kernel_count",
-    "cupti_begin_tolerance_us",
-    "cupti_end_tolerance_us",
-    "cupti_repeat_guard_us",
     "input_policy",
     "input_policy_seed",
     "fallback_reason",
@@ -373,8 +371,7 @@ def summarize_bench_provenance(bench_ops: dict) -> list[dict]:
         "count": 0,
         "sampled": [],
         "expected": [],
-        "guard": set(),
-        "tolerance": set(),
+        "attribution": set(),
         "fallback": 0,
     })
 
@@ -394,13 +391,9 @@ def summarize_bench_provenance(bench_ops: dict) -> list[dict]:
         expected = provenance.get("cupti_expected_kernel_count")
         if isinstance(expected, (int, float)):
             d["expected"].append(int(expected))
-        guard = provenance.get("cupti_repeat_guard_us")
-        if guard is not None:
-            d["guard"].add(guard)
-        begin = provenance.get("cupti_begin_tolerance_us")
-        end = provenance.get("cupti_end_tolerance_us")
-        if begin is not None or end is not None:
-            d["tolerance"].add((begin, end))
+        attribution = provenance.get("cupti_attribution")
+        if attribution is not None:
+            d["attribution"].add(attribution)
         if provenance.get("fallback_reason"):
             d["fallback"] += 1
 
@@ -428,8 +421,7 @@ def summarize_bench_provenance(bench_ops: dict) -> list[dict]:
             "sampled_max": max(sampled) if sampled else None,
             "expected_min": min(expected) if expected else None,
             "expected_max": max(expected) if expected else None,
-            "guard": _format_set(d["guard"]),
-            "tolerance": _format_tolerance_set(d["tolerance"]),
+            "attribution": _format_set(d["attribution"]),
             "fallback": d["fallback"],
         })
     return sorted(rows, key=lambda r: (r["role"], r["timing"], r["input_policy"]))
@@ -444,17 +436,6 @@ def _format_set(values: set) -> str:
             formatted.append(f"{value:.1f}")
         else:
             formatted.append(str(value))
-    return ", ".join(formatted)
-
-
-def _format_tolerance_set(values: set[tuple]) -> str:
-    if not values:
-        return "-"
-    formatted = []
-    for begin, end in sorted(values, key=str):
-        begin_s = f"{begin:.1f}" if isinstance(begin, float) else str(begin)
-        end_s = f"{end:.1f}" if isinstance(end, float) else str(end)
-        formatted.append(f"{begin_s}/{end_s}")
     return ", ".join(formatted)
 
 
@@ -619,18 +600,17 @@ def generate_report(
         if provenance_rows:
             lines.append("## Benchmark Timing Provenance")
             lines.append("")
-            lines.append("| Role | Timing | Input Policy | Entries | Sampled Calls |"
-                         " Expected Kernels | Guard us | Tolerance begin/end us |"
-                         " Fallbacks |")
-            lines.append("|:-----|:-------|:-------------|--------:|:--------------|"
-                         ":-----------------|:---------|:-----------------------|----------:|")
+            lines.append("| Role | Timing | Attribution | Input Policy | Entries |"
+                         " Sampled Calls | Expected Kernels | Fallbacks |")
+            lines.append("|:-----|:-------|:------------|:-------------|--------:|"
+                         ":--------------|:-----------------|----------:|")
             for row in provenance_rows:
                 sampled = _format_range(row["sampled_min"], row["sampled_max"])
                 expected = _format_range(row["expected_min"], row["expected_max"])
                 lines.append(
-                    f"| {row['role']} | {row['timing']} | {row['input_policy']} "
-                    f"| {row['count']} | {sampled} | {expected} | {row['guard']} "
-                    f"| {row['tolerance']} | {row['fallback']} |"
+                    f"| {row['role']} | {row['timing']} | {row['attribution']} "
+                    f"| {row['input_policy']} | {row['count']} | {sampled} "
+                    f"| {expected} | {row['fallback']} |"
                 )
             lines.append("")
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -71,10 +70,13 @@ def collect_repeats(
 ) -> dict[str, Any]:
     """Collect CUPTI activities for ``n_repeat`` logical calls.
 
-    ``run_one(i)`` is called once per repeat. Each call is wrapped by a CPU
-    timestamp window taken from ``cuptiGetTimestamp``. CUDA work is synchronized
-    before the end timestamp so every kernel activity for the call should fall
-    inside that repeat's attribution window.
+    ``run_one(i)`` is called once per repeat inside an external-correlation
+    scope, so every kernel it launches is attributed to repeat ``i`` by the
+    launch's correlation ID rather than by comparing GPU activity timestamps
+    against CPU windows. ``prepare_one(i)`` runs inside a separate prepare
+    scope whose kernels (input-pool copies, L2 flush fills) are excluded from
+    attribution structurally. CPU timestamp windows are still recorded for
+    diagnostics only.
     """
     ext = load_extension()
     started = False
@@ -83,7 +85,11 @@ def collect_repeats(
         started = True
         for i in range(n_repeat):
             if prepare_one is not None:
-                prepare_one(i)
+                ext.begin_prepare(i)
+                try:
+                    prepare_one(i)
+                finally:
+                    ext.end_prepare(i)
             ext.begin_repeat(i)
             try:
                 run_one(i)
@@ -92,27 +98,7 @@ def collect_repeats(
                 torch.cuda.synchronize()
             finally:
                 ext.end_repeat(i)
-                _guard_next_repeat()
     finally:
         if started:
             ext.stop()
     return ext.results()
-
-
-def _guard_next_repeat() -> None:
-    """Insert host-side spacing after the attribution window.
-
-    This keeps adjacent CPU/CUPTI timestamp windows separated without adding
-    CUDA work that could perturb the next iteration's activity sequence.
-    """
-    guard_us = repeat_guard_us()
-    if guard_us <= 0:
-        return
-
-    deadline_ns = time.perf_counter_ns() + int(guard_us * 1000.0)
-    while time.perf_counter_ns() < deadline_ns:
-        pass
-
-
-def repeat_guard_us() -> float:
-    return float(os.environ.get("TILEOPS_CUPTI_REPEAT_GUARD_US", "16.0"))

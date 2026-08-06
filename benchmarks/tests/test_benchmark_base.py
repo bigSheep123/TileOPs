@@ -10,13 +10,13 @@ import torch
 from benchmarks.benchmark_base import (
     BenchmarkReport,
     ManifestBenchmark,
-    _NativeCuptiAttributionError,
-    _ShiftingTensorPool,
     _attributed_mean_latency_ms,
     _bench_meta,
     _kernel_span_us,
-    _kernels_by_cpu_window,
+    _kernels_by_repeat,
+    _NativeCuptiAttributionError,
     _select_expected_sequence,
+    _ShiftingTensorPool,
     bench_kernel,
     workloads_to_params,
 )
@@ -164,32 +164,45 @@ def test_kernel_span_uses_activity_envelope():
     assert _kernel_span_us(kernels) == 8.0
 
 
-def _kernel(name: str, start_ns: int, end_ns: int) -> dict:
-    return {"name": name, "start_ns": start_ns, "end_ns": end_ns}
+def _kernel(name: str, start_ns: int, end_ns: int, correlation: int = 0) -> dict:
+    return {
+        "name": name,
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "correlation_id": correlation,
+    }
 
 
-def test_kernels_by_cpu_window_applies_boundary_tolerances(monkeypatch):
-    monkeypatch.setenv("TILEOPS_CUPTI_WINDOW_BEGIN_TOLERANCE_US", "2")
-    monkeypatch.setenv("TILEOPS_CUPTI_WINDOW_END_TOLERANCE_US", "8")
+def _scope(external_id: int, correlation_id: int, prepare: bool = False) -> dict:
+    return {
+        "external_id": external_id,
+        "correlation_id": correlation_id,
+        "prepare": prepare,
+    }
+
+
+def test_kernels_by_repeat_attributes_by_external_correlation():
     trace = {
-        "cpu_windows": [
-            {"repeat": 0, "begin_ns": 10_000, "end_ns": 20_000},
-            {"repeat": 1, "begin_ns": 40_000, "end_ns": 50_000},
+        "external_correlations": [
+            _scope(0, 11),
+            _scope(0, 12, prepare=True),
+            _scope(1, 13),
         ],
         "kernels": [
-            _kernel("begin-edge", 8_000, 9_000),
-            _kernel("end-edge", 20_000, 28_000),
-            _kernel("outside", 28_001, 29_000),
-            _kernel("next", 40_000, 41_000),
+            _kernel("prepare-fill", 5_000, 6_000, correlation=12),
+            _kernel("timed-a", 10_000, 11_000, correlation=11),
+            _kernel("foreign", 20_000, 21_000, correlation=99),
+            _kernel("timed-b", 40_000, 41_000, correlation=13),
         ],
     }
 
-    grouped = _kernels_by_cpu_window(trace)
+    grouped, unattributed = _kernels_by_repeat(trace, 2)
 
     assert [_kernel_sequence_names(group) for group in grouped] == [
-        ["begin-edge", "end-edge"],
-        ["next"],
+        ["timed-a"],
+        ["timed-b"],
     ]
+    assert _kernel_sequence_names(unattributed) == ["foreign"]
 
 
 def _kernel_sequence_names(kernels: list[dict]) -> list[str]:
@@ -231,20 +244,21 @@ def test_select_expected_sequence_rejects_incomplete_or_changed_call(actual):
     assert _select_expected_sequence(actual, ("a", "b")) is None
 
 
-def test_attributed_latency_requires_every_repeat(monkeypatch):
-    monkeypatch.setenv("TILEOPS_CUPTI_WINDOW_BEGIN_TOLERANCE_US", "0")
-    monkeypatch.setenv("TILEOPS_CUPTI_WINDOW_END_TOLERANCE_US", "0")
+def test_attributed_latency_requires_every_repeat():
     trace = {
         "dropped": 0,
-        "cpu_windows": [
-            {"repeat": 0, "begin_ns": 1_000, "end_ns": 10_000},
-            {"repeat": 1, "begin_ns": 20_000, "end_ns": 30_000},
+        "external_correlations": [
+            _scope(0, 1),
+            _scope(0, 2),
+            _scope(1, 3),
+            _scope(1, 4),
+            _scope(1, 5),
         ],
         "kernels": [
-            _kernel("a", 2_000, 4_000),
-            _kernel("b", 3_000, 8_000),
-            _kernel("a", 21_000, 22_000),
-            _kernel("b", 23_000, 29_000),
+            _kernel("a", 2_000, 4_000, correlation=1),
+            _kernel("b", 3_000, 8_000, correlation=2),
+            _kernel("a", 21_000, 22_000, correlation=3),
+            _kernel("b", 23_000, 29_000, correlation=4),
         ],
     }
 
@@ -253,13 +267,31 @@ def test_attributed_latency_requires_every_repeat(monkeypatch):
     assert latency_ms == pytest.approx(0.007)
     assert _bench_meta.cupti_sampled_calls == 2
     assert _bench_meta.cupti_expected_kernel_count == 2
+    assert _bench_meta.cupti_attribution == "external-correlation"
 
-    trace["kernels"].append(_kernel("unexpected", 29_000, 29_500))
+    trace["kernels"].append(_kernel("unexpected", 29_000, 29_500, correlation=5))
     with pytest.raises(
         _NativeCuptiAttributionError,
         match="attributed 1/2 complete expected kernel sequences",
     ):
         _attributed_mean_latency_ms(trace, ("a", "b"), n_repeat=2)
+
+
+def test_attributed_latency_rejects_unattributed_kernels():
+    """A kernel with no scope (e.g. launched off-thread) fails attribution."""
+    trace = {
+        "dropped": 0,
+        "external_correlations": [_scope(0, 1)],
+        "kernels": [
+            _kernel("a", 2_000, 4_000, correlation=1),
+            _kernel("foreign", 5_000, 6_000, correlation=42),
+        ],
+    }
+    with pytest.raises(
+        _NativeCuptiAttributionError,
+        match="outside any attribution scope",
+    ):
+        _attributed_mean_latency_ms(trace, ("a",), n_repeat=1)
 
 
 def test_attributed_latency_rejects_dropped_records():

@@ -7,11 +7,9 @@ from benchmarks.benchmark_base import BenchmarkReport, _bench_results
 
 _BENCH_PROVENANCE_KEYS = (
     "timing",
+    "cupti_attribution",
     "cupti_sampled_calls",
     "cupti_expected_kernel_count",
-    "cupti_begin_tolerance_us",
-    "cupti_end_tolerance_us",
-    "cupti_repeat_guard_us",
     "input_policy",
     "input_policy_seed",
     "fallback_reason",
