@@ -3,6 +3,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
@@ -30,20 +31,29 @@ struct KernelRecord {
   uint32_t stream;
 };
 
-// One entry per correlated API call: maps the call's CUPTI correlationId to
-// the external scope (repeat or prepare) that was pushed around it.
-struct ExternalRecord {
-  uint64_t external_id;
+// One entry per kernel launch call: maps the launch's CUPTI correlationId to
+// the scope (repeat or prepare) that was active when the call entered. The
+// scope is process-global, so launches from any thread (e.g. the autograd
+// engine worker) are attributed to the surrounding logical call.
+struct LaunchScope {
   uint32_t correlation;
+  int repeat;
   bool prepare;
 };
+
+constexpr int kPhaseNone = -1;
+constexpr int kPhasePrepare = 0;
+constexpr int kPhaseRepeat = 1;
 
 std::mutex g_mutex;
 bool g_active = false;
 bool g_callbacks_registered = false;
+CUpti_SubscriberHandle g_subscriber = nullptr;
+std::atomic<int> g_phase{kPhaseNone};
+std::atomic<int> g_scope_index{-1};
 std::vector<CpuWindow> g_windows;
 std::vector<KernelRecord> g_kernels;
-std::vector<ExternalRecord> g_externals;
+std::vector<LaunchScope> g_launches;
 size_t g_dropped = 0;
 
 #define CUPTI_CHECK(call)                                                       \
@@ -73,21 +83,8 @@ void buffer_requested(uint8_t** buffer, size_t* size, size_t* max_num_records) {
 }
 
 void handle_record(CUpti_Activity* record) {
-  if (record->kind == CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION) {
-    auto* ec = reinterpret_cast<CUpti_ActivityExternalCorrelation*>(record);
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_externals.push_back({
-        ec->externalId,
-        ec->correlationId,
-        ec->externalKind == CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM1,
-    });
-    return;
-  }
   if (record->kind != CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL &&
       record->kind != CUPTI_ACTIVITY_KIND_KERNEL) {
-    // Runtime/driver API records are enabled only so external correlation
-    // records are generated at each launch site; the API records themselves
-    // are not needed.
     return;
   }
 
@@ -127,8 +124,49 @@ void reset_state() {
   std::lock_guard<std::mutex> lock(g_mutex);
   g_windows.clear();
   g_kernels.clear();
-  g_externals.clear();
+  g_launches.clear();
   g_dropped = 0;
+}
+
+// Fires on entry to the handful of kernel-launch API calls (runtime and
+// driver, any thread) and records the launch's correlationId against the
+// currently active scope. The body is one relaxed load plus a vector append;
+// unlike RUNTIME/DRIVER activity tracing it writes no per-call activity
+// records, so the launch path is not measurably perturbed.
+void CUPTIAPI launch_callback(void* /*userdata*/, CUpti_CallbackDomain /*domain*/,
+                              CUpti_CallbackId /*cbid*/, const void* cbdata) {
+  auto* data = reinterpret_cast<const CUpti_CallbackData*>(cbdata);
+  if (data->callbackSite != CUPTI_API_ENTER) {
+    return;
+  }
+  int phase = g_phase.load(std::memory_order_relaxed);
+  if (phase == kPhaseNone) {
+    return;
+  }
+  int index = g_scope_index.load(std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_launches.push_back({data->correlationId, index, phase == kPhasePrepare});
+}
+
+void enable_launch_callbacks() {
+  CUPTI_CHECK(cuptiEnableCallback(
+      1, g_subscriber, CUPTI_CB_DOMAIN_RUNTIME_API,
+      CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000));
+  CUPTI_CHECK(cuptiEnableCallback(
+      1, g_subscriber, CUPTI_CB_DOMAIN_RUNTIME_API,
+      CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernelExC_v11060));
+  CUPTI_CHECK(cuptiEnableCallback(
+      1, g_subscriber, CUPTI_CB_DOMAIN_RUNTIME_API,
+      CUPTI_RUNTIME_TRACE_CBID_cudaLaunchCooperativeKernel_v9000));
+  CUPTI_CHECK(cuptiEnableCallback(
+      1, g_subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
+      CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel));
+  CUPTI_CHECK(cuptiEnableCallback(
+      1, g_subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
+      CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx));
+  CUPTI_CHECK(cuptiEnableCallback(
+      1, g_subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
+      CUPTI_DRIVER_TRACE_CBID_cuLaunchCooperativeKernel));
 }
 
 uint64_t timestamp() {
@@ -146,15 +184,15 @@ void start() {
     CUPTI_CHECK(cuptiActivityRegisterCallbacks(buffer_requested, buffer_completed));
     g_callbacks_registered = true;
   }
+  // Kernel timestamps come from kernel activity records; kernels are
+  // attributed to repeats by the launch-callback correlation map, never by
+  // timestamps. No API activity tracing is enabled, so the launch path pays
+  // no per-call record writes.
   CUPTI_CHECK(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
-  // Kernels are attributed to repeats by external correlation, never by
-  // timestamps. Runtime and driver API activity must both be enabled so a
-  // correlation record is generated per launch regardless of which API layer
-  // the launch goes through (torch uses the runtime API, TVM-FFI/TileLang and
-  // Triton launch through the driver API).
-  CUPTI_CHECK(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION));
-  CUPTI_CHECK(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME));
-  CUPTI_CHECK(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DRIVER));
+  if (g_subscriber == nullptr) {
+    CUPTI_CHECK(cuptiSubscribe(&g_subscriber, launch_callback, nullptr));
+    enable_launch_callbacks();
+  }
   g_active = true;
 }
 
@@ -162,29 +200,23 @@ void stop() {
   if (!g_active) {
     return;
   }
+  g_phase.store(kPhaseNone, std::memory_order_relaxed);
   cudaDeviceSynchronize();
   CUPTI_CHECK(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED));
-  CUPTI_CHECK(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_DRIVER));
-  CUPTI_CHECK(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_RUNTIME));
-  CUPTI_CHECK(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION));
   CUPTI_CHECK(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
+  if (g_subscriber != nullptr) {
+    CUPTI_CHECK(cuptiUnsubscribe(g_subscriber));
+    g_subscriber = nullptr;
+  }
   g_active = false;
 }
 
-void pop_scope(CUpti_ExternalCorrelationKind kind, int repeat,
-               const char* scope_name) {
-  uint64_t popped = 0;
-  CUPTI_CHECK(cuptiActivityPopExternalCorrelationId(kind, &popped));
-  if (popped != static_cast<uint64_t>(repeat)) {
-    throw std::runtime_error(
-        std::string("native CUPTI ") + scope_name + " scope mismatch: popped " +
-        std::to_string(popped) + ", expected " + std::to_string(repeat));
-  }
-}
+// Scope transitions happen on the benchmark thread while the device is
+// synchronized, so no launch callback can observe a torn phase/index pair.
 
 void begin_repeat(int repeat) {
-  CUPTI_CHECK(cuptiActivityPushExternalCorrelationId(
-      CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, static_cast<uint64_t>(repeat)));
+  g_scope_index.store(repeat, std::memory_order_relaxed);
+  g_phase.store(kPhaseRepeat, std::memory_order_relaxed);
   // The CPU window is recorded for diagnostics only; it plays no role in
   // attribution.
   uint64_t t = timestamp();
@@ -193,7 +225,7 @@ void begin_repeat(int repeat) {
 }
 
 void end_repeat(int repeat) {
-  pop_scope(CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, repeat, "repeat");
+  g_phase.store(kPhaseNone, std::memory_order_relaxed);
   uint64_t t = timestamp();
   std::lock_guard<std::mutex> lock(g_mutex);
   for (auto it = g_windows.rbegin(); it != g_windows.rend(); ++it) {
@@ -206,12 +238,12 @@ void end_repeat(int repeat) {
 }
 
 void begin_prepare(int repeat) {
-  CUPTI_CHECK(cuptiActivityPushExternalCorrelationId(
-      CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM1, static_cast<uint64_t>(repeat)));
+  g_scope_index.store(repeat, std::memory_order_relaxed);
+  g_phase.store(kPhasePrepare, std::memory_order_relaxed);
 }
 
-void end_prepare(int repeat) {
-  pop_scope(CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM1, repeat, "prepare");
+void end_prepare(int /*repeat*/) {
+  g_phase.store(kPhaseNone, std::memory_order_relaxed);
 }
 
 py::dict results() {
@@ -239,19 +271,19 @@ py::dict results() {
     kernels.append(d);
   }
 
-  py::list externals;
-  for (const auto& e : g_externals) {
+  py::list launches;
+  for (const auto& l : g_launches) {
     py::dict d;
-    d["external_id"] = e.external_id;
-    d["correlation_id"] = e.correlation;
-    d["prepare"] = e.prepare;
-    externals.append(d);
+    d["correlation_id"] = l.correlation;
+    d["repeat"] = l.repeat;
+    d["prepare"] = l.prepare;
+    launches.append(d);
   }
 
   py::dict out;
   out["cpu_windows"] = windows;
   out["kernels"] = kernels;
-  out["external_correlations"] = externals;
+  out["launch_scopes"] = launches;
   out["dropped"] = g_dropped;
   return out;
 }

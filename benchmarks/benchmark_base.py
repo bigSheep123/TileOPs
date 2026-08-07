@@ -146,26 +146,29 @@ def _kernels_by_repeat(
     trace: dict,
     n_repeat: int,
 ) -> tuple[list[list[dict]], list[dict]]:
-    """Group CUPTI kernel activities by their external-correlation scope.
+    """Group CUPTI kernel activities by their launch-callback scope.
 
     Each kernel record carries the correlation ID of the launch call that
-    produced it; the collector maps every launch to the repeat (or prepare)
-    scope pushed around it. Attribution is therefore an ID join, immune to the
-    microsecond-level skew between CPU and GPU activity timestamps.
+    produced it; the collector's launch callback maps every launch — from any
+    thread, including the autograd engine worker — to the repeat (or prepare)
+    scope active when the call entered. Attribution is therefore an ID join,
+    immune to the microsecond-level skew between CPU and GPU activity
+    timestamps.
 
     Returns ``(grouped, unattributed)``: ``grouped[i]`` holds the kernels of
     repeat ``i``; prepare-scope kernels (input-pool copies, L2 flush fills) are
     dropped; ``unattributed`` collects kernels matching no scope at all (e.g.
-    launched from another thread), which callers treat as attribution failure.
+    launched through an unhooked API path), which callers treat as attribution
+    failure.
     """
     repeat_by_correlation: dict[int, int] = {}
     prepare_correlations: set[int] = set()
-    for entry in trace.get("external_correlations", []):
+    for entry in trace.get("launch_scopes", []):
         correlation = int(entry["correlation_id"])
         if entry.get("prepare"):
             prepare_correlations.add(correlation)
         else:
-            repeat_by_correlation[correlation] = int(entry["external_id"])
+            repeat_by_correlation[correlation] = int(entry["repeat"])
 
     grouped: list[list[dict]] = [[] for _ in range(n_repeat)]
     unattributed: list[dict] = []
@@ -532,7 +535,7 @@ def _attributed_mean_latency_ms(
 
     _bench_meta.cupti_sampled_calls = len(samples_us)
     _bench_meta.cupti_expected_kernel_count = len(expected_sequence)
-    _bench_meta.cupti_attribution = "external-correlation"
+    _bench_meta.cupti_attribution = "launch-correlation"
     return (sum(samples_us) / len(samples_us)) * 1e-3
 
 
@@ -612,10 +615,11 @@ def bench_kernel(
       4. Report the median trial mean (robust to outlier trials).
 
     Uses native CUPTI activity records instead of PyTorch profiler/Kineto
-    projection. Each timed repeat runs inside a CUPTI external-correlation
-    scope, so every kernel activity is attributed to its logical call by the
-    launch's correlation ID; no GPU timestamp is ever compared against a CPU
-    clock. A discovery pass records the expected per-call kernel sequence;
+    projection. A CUPTI launch callback maps every kernel launch — from any
+    thread, including the autograd engine worker — to the active repeat scope,
+    so every kernel activity is attributed to its logical call by the launch's
+    correlation ID; no GPU timestamp is ever compared against a CPU clock and
+    no per-call API activity records are written. A discovery pass records the expected per-call kernel sequence;
     timed repeats then measure each complete sequence from the earliest
     selected kernel start to the latest selected kernel end. This degenerates
     to pure kernel duration for single-kernel calls and preserves inter-kernel

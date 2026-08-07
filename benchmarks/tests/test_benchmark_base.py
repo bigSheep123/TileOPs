@@ -173,17 +173,17 @@ def _kernel(name: str, start_ns: int, end_ns: int, correlation: int = 0) -> dict
     }
 
 
-def _scope(external_id: int, correlation_id: int, prepare: bool = False) -> dict:
+def _scope(repeat: int, correlation_id: int, prepare: bool = False) -> dict:
     return {
-        "external_id": external_id,
+        "repeat": repeat,
         "correlation_id": correlation_id,
         "prepare": prepare,
     }
 
 
-def test_kernels_by_repeat_attributes_by_external_correlation():
+def test_kernels_by_repeat_attributes_by_launch_scope():
     trace = {
-        "external_correlations": [
+        "launch_scopes": [
             _scope(0, 11),
             _scope(0, 12, prepare=True),
             _scope(1, 13),
@@ -247,7 +247,7 @@ def test_select_expected_sequence_rejects_incomplete_or_changed_call(actual):
 def test_attributed_latency_requires_every_repeat():
     trace = {
         "dropped": 0,
-        "external_correlations": [
+        "launch_scopes": [
             _scope(0, 1),
             _scope(0, 2),
             _scope(1, 3),
@@ -267,7 +267,7 @@ def test_attributed_latency_requires_every_repeat():
     assert latency_ms == pytest.approx(0.007)
     assert _bench_meta.cupti_sampled_calls == 2
     assert _bench_meta.cupti_expected_kernel_count == 2
-    assert _bench_meta.cupti_attribution == "external-correlation"
+    assert _bench_meta.cupti_attribution == "launch-correlation"
 
     trace["kernels"].append(_kernel("unexpected", 29_000, 29_500, correlation=5))
     with pytest.raises(
@@ -281,7 +281,7 @@ def test_attributed_latency_rejects_unattributed_kernels():
     """A kernel with no scope (e.g. launched off-thread) fails attribution."""
     trace = {
         "dropped": 0,
-        "external_correlations": [_scope(0, 1)],
+        "launch_scopes": [_scope(0, 1)],
         "kernels": [
             _kernel("a", 2_000, 4_000, correlation=1),
             _kernel("foreign", 5_000, 6_000, correlation=42),

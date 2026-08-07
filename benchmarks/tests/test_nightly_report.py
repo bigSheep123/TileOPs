@@ -38,7 +38,7 @@ def test_benchmark_provenance_flows_from_junit_into_history(tmp_path, monkeypatc
     )
     provenance = {
         "timing": "native-cupti",
-        "cupti_attribution": "external-correlation",
+        "cupti_attribution": "launch-correlation",
         "cupti_sampled_calls": 50,
         "cupti_expected_kernel_count": 2,
         "input_policy": "shifting-pool",

@@ -70,13 +70,13 @@ def collect_repeats(
 ) -> dict[str, Any]:
     """Collect CUPTI activities for ``n_repeat`` logical calls.
 
-    ``run_one(i)`` is called once per repeat inside an external-correlation
-    scope, so every kernel it launches is attributed to repeat ``i`` by the
-    launch's correlation ID rather than by comparing GPU activity timestamps
-    against CPU windows. ``prepare_one(i)`` runs inside a separate prepare
-    scope whose kernels (input-pool copies, L2 flush fills) are excluded from
-    attribution structurally. CPU timestamp windows are still recorded for
-    diagnostics only.
+    ``run_one(i)`` is called once per repeat inside a launch-callback scope,
+    so every kernel it launches — from any thread — is attributed to repeat
+    ``i`` by the launch's correlation ID rather than by comparing GPU activity
+    timestamps against CPU windows. ``prepare_one(i)`` runs inside a separate
+    prepare scope whose kernels (input-pool copies, L2 flush fills) are
+    excluded from attribution structurally. CPU timestamp windows are still
+    recorded for diagnostics only.
     """
     ext = load_extension()
     started = False
