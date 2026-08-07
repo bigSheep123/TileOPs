@@ -130,9 +130,9 @@ void reset_state() {
 
 // Fires on entry to the handful of kernel-launch API calls (runtime and
 // driver, any thread) and records the launch's correlationId against the
-// currently active scope. The body is one relaxed load plus a vector append;
-// unlike RUNTIME/DRIVER activity tracing it writes no per-call activity
-// records, so the launch path is not measurably perturbed.
+// currently active scope. The body is two relaxed loads plus a mutex-guarded
+// vector append; unlike RUNTIME/DRIVER activity tracing it writes no per-call
+// activity records, so the launch path is not measurably perturbed.
 void CUPTIAPI launch_callback(void* /*userdata*/, CUpti_CallbackDomain /*domain*/,
                               CUpti_CallbackId /*cbid*/, const void* cbdata) {
   auto* data = reinterpret_cast<const CUpti_CallbackData*>(cbdata);
