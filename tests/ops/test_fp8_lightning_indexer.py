@@ -3,6 +3,7 @@ import re
 import pytest
 import torch
 
+from tests.cuda_graph_contract import CapturedGraph
 from tests.workload_test_base import FixtureBase, TestBase
 from tileops.attention import FP8LightningIndexerFwdOp
 from workloads.attention.fp8_lightning_indexer import FP8LightningIndexerWorkload
@@ -217,3 +218,40 @@ def test_indexer_assumes_nonnegative_external_scales(groups) -> None:
     scales[:, 1::2] = 0
     op = FP8LightningIndexerFwdOp(assume_nonnegative_scale=True, target=BUILTIN)
     test.check(op, q, k, weights, starts, ends, scales)
+
+
+@pytest.mark.sm90
+@pytest.mark.cuda_graph(op="FP8LightningIndexerFwdOp")
+@pytest.mark.parametrize(
+    "seq_len_kv",
+    [
+        pytest.param(4096 // 4, marks=pytest.mark.smoke, id="deepseek-v4-flash-indexer"),
+        pytest.param(4128 // 4, marks=pytest.mark.full, id="deepseek-v4-flash-indexer-4128"),
+    ],
+)
+def test_indexer_graph_replay(seq_len_kv: int) -> None:
+    """DeepSeek-V4-Flash's decode-step indexer logits of one query over the ratio-4 entries of
+    max_seq_len 4096 and 4128, without the -inf fill and with nonnegative key scales, replayed
+    at a window end halfway and at the last entry; only the window's logits are compared. The
+    replays hold the window start, 0 in every decode step."""
+    test = FP8LightningIndexerTest(1, 1, 64, 128, seq_len_kv, 1, False)
+    op = FP8LightningIndexerFwdOp(clean_logits=False, assume_nonnegative_scale=True)
+    device = run_device()
+
+    def draw(end: int) -> tuple[torch.Tensor, ...]:
+        q = torch.randn(1, 1, 64, 128, device=device).to(torch.float8_e4m3fn)
+        k = torch.randn(1, seq_len_kv, 1, 128, device=device).to(torch.float8_e4m3fn)
+        weights = torch.randn(1, 64, device=device)
+        starts = torch.zeros(1, dtype=torch.int32, device=device)
+        ends = torch.full((1,), end, dtype=torch.int32, device=device)
+        scales = torch.rand(1, seq_len_kv, 1, device=device) / 448.0
+        return q, k, weights, starts, ends, scales
+
+    inputs = draw(1)
+    graph = CapturedGraph((op, inputs))
+    for end in (seq_len_kv // 2, seq_len_kv):
+        fresh = draw(end)
+        graph.renew(fresh)
+        graph.replay(held=[inputs[3]])
+        graph.outputs[0][:, :, end:] = float("-inf")
+        test.check(op, *fresh, runs=lambda *args, **kwargs: graph.outputs[0])

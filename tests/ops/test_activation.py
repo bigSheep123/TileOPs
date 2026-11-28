@@ -286,15 +286,15 @@ def test_sigmoid_tuned() -> None:
     [
         pytest.param(
             ReLUFwdOp,
-            64 * (4096 // 4),
+            64 * 1024,
             marks=[pytest.mark.smoke, pytest.mark.cuda_graph(op="ReLUFwdOp")],
-            id="deepseek-v4-flash-indexer-scores",
+            id="relu-64x1024",
         ),
         pytest.param(
             ReLUFwdOp,
-            64 * (4128 // 4),
+            64 * 1032,
             marks=[pytest.mark.full, pytest.mark.cuda_graph(op="ReLUFwdOp")],
-            id="deepseek-v4-flash-indexer-scores-4128",
+            id="relu-64x1032",
         ),
         pytest.param(
             SigmoidFwdOp,
@@ -305,8 +305,8 @@ def test_sigmoid_tuned() -> None:
     ],
 )
 def test_activation_graph_replay(op_type, n_total: int) -> None:
-    """A bfloat16 activation of one decode token: DeepSeek-V4-Flash's indexer scores rectified,
-    Qwen3.8-27B's attention gate."""
+    """A bfloat16 activation the size of a decode step's: ReLU over 64 rows of 1024 and of 1032,
+    Sigmoid over Qwen3.8-27B's attention gate."""
     check_replay(UnaryActivationTest(n_total, torch.bfloat16, op_type.__name__), op_type())
 
 

@@ -321,26 +321,15 @@ def test_bmm_takes_operands_of_any_strides(batch: int, m: int, n: int, k: int):
 @pytest.mark.parametrize(
     "batch, m, n, k",
     [
-        pytest.param(
-            1, 64, 4096 // 4, 128, marks=pytest.mark.smoke,
-            id="deepseek-v4-flash-indexer-scores",
-        ),
-        pytest.param(
-            1, 64, 4128 // 4, 128, marks=pytest.mark.full,
-            id="deepseek-v4-flash-indexer-scores-4128",
-        ),
-        pytest.param(
-            1, 1, 4096 // 4, 64, marks=pytest.mark.full, id="deepseek-v4-flash-indexer-logits"
-        ),
-        pytest.param(
-            1, 1, 4128 // 4, 64, marks=pytest.mark.full,
-            id="deepseek-v4-flash-indexer-logits-4128",
-        ),
+        pytest.param(1, 64, 1024, 128, marks=pytest.mark.smoke, id="m64-n1024"),
+        pytest.param(1, 64, 1032, 128, marks=pytest.mark.full, id="m64-n1032"),
+        pytest.param(1, 1, 1024, 64, marks=pytest.mark.full, id="m1-n1024"),
+        pytest.param(1, 1, 1032, 64, marks=pytest.mark.full, id="m1-n1032"),
     ],
-)  # fmt: skip
+)
 def test_bmm_graph_replay(batch: int, m: int, n: int, k: int) -> None:
-    """DeepSeek-V4-Flash's decode-step indexer scores and logits over the compressed entries of
-    max_seq_len 4096 and 4128."""
+    """A one-batch product the size of a decode step's, of 64 rows and of one, over 1024 and
+    1032 columns."""
     check_replay(BMMTest(batch, m, n, k, torch.bfloat16), BMMFwdOp())
 
 

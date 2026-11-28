@@ -19,6 +19,7 @@ QUALIFIED_OPS = frozenset(
         "DSADenseFwdOp",
         "EmbeddingFwdOp",
         "FP4QuantPerGroupFwdOp",
+        "FP8LightningIndexerFwdOp",
         "FP8QuantPerTokenGroupFwdOp",
         "FusedAddRMSNormFwdOp",
         "FusedMoEExpertsFwdOp",
