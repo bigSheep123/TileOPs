@@ -17,7 +17,7 @@ import torch
 from models.deepseek_v4_flash import DeepseekV4FlashConfig, DeepseekV4FlashForCausalLM
 from models.deepseek_v4_flash.layers import Step
 from models.deepseek_v4_flash.loader import load_outside, load_weights
-from models.deepseek_v4_flash.ops import RoPETable
+from models.deepseek_v4_flash.ops import RoPETable, SideStreams
 from tests.models.conftest import Recorded
 from workloads.device import run_device
 from workloads.models.checkpoint import write_checkpoint
@@ -222,7 +222,7 @@ def test_layers_and_logits_match_the_official_model(checkpoint, prompt_len, deco
                 indexer = layer.attn.indexer
                 layer.attn.indexer = Recorded(
                     indexer,
-                    lambda idx, ops, rope, x, q, step, ratio=indexer.ratio: selections.append(
+                    lambda idx, ops, rope, q, weights, step, ratio=indexer.ratio: selections.append(
                         (idx, step.start_pos, step.offset, ratio)
                     ),
                 )
@@ -294,12 +294,34 @@ def test_generate_takes_the_official_argmax(checkpoint):
             )
 
 
+def _delay_side_streams(monkeypatch) -> None:
+    """Queue a sleep at the head of every side-stream block of the graphs captured from here on,
+    so the current stream, reading a block's result without waiting for it, reads it
+    unfinished."""
+    on = SideStreams.on
+
+    def delayed_on(self, i):
+        block = on(self, i)
+        if self._mark is not None:
+            with self.streams[i]:
+                torch.cuda._sleep(60_000)
+        return block
+
+    monkeypatch.setattr(SideStreams, "on", delayed_on)
+
+
 @pytest.mark.sm90
-def test_decode_replays_the_eager_step_bitwise_in_every_phase(checkpoint, graph_calls):
+@pytest.mark.parametrize("delayed", [False, True], ids=["in-order", "late-side"])
+def test_decode_replays_the_eager_step_bitwise_in_every_phase(
+    checkpoint, graph_calls, monkeypatch, delayed
+):
     """Decode steps replayed from CUDA graphs return the eager step's logits bitwise and leave
     the same KV and indexer caches, over two requests: the first, from a one-token prompt, takes
     each of the four phases at least twice; the second replays the graphs the first captured.
-    An indexer top-k of 8 lets its scores reach the logits."""
+    An indexer top-k of 8 lets its scores reach the logits. Delayed side-stream blocks change
+    no result, so the current stream waits for each block it reads."""
+    if delayed:
+        _delay_side_streams(monkeypatch)
     path, _ = checkpoint
     config = DeepseekV4FlashConfig.from_hf({**_SMALL, "index_topk": 8})
     eager, graph = (

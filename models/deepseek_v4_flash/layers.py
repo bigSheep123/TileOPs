@@ -259,42 +259,58 @@ class Indexer:
         warp-specialized kernel takes."""
         return -(-entries // 4) * 4
 
+    def pool(
+        self, ops: ModelOps, rope: RoPETable, x: torch.Tensor, step: Step
+    ) -> torch.Tensor | None:
+        """Pool ``x`` (``[S, dim]``) into ``cache`` and ``cache_scale`` and return the queries'
+        head weights, ``[S, n_heads]`` bfloat16, or None while no window of ``ratio`` tokens has
+        closed. Under a parallel fork of ``ops.side`` the pooling runs on side stream 1 and the
+        head weights on side stream 2, which ``__call__`` waits for before reading any of
+        them."""
+        with ops.side.on(1):
+            entries = self.compressor(ops, rope, x, step)
+            if entries is not None:
+                n = entries.shape[1]
+                codes, scales, _ = ops.act_quant(entries.view(n, self.head_dim))
+                if step.start_pos == 0:
+                    self.cache[:, :n] = codes.view(1, n, 1, self.head_dim)
+                    self.cache_scale[:, :n] = scales.view(1, n, 1)
+                else:
+                    slot = (step.starts // self.ratio).long()
+                    codes = codes.view(torch.uint8).view(1, 1, 1, self.head_dim)
+                    self.cache.view(torch.uint8).index_copy_(1, slot, codes)
+                    self.cache_scale.index_copy_(1, slot, scales.view(1, 1, 1))
+        if not step.has_entries(self.ratio):
+            return None
+        with ops.side.on(2):
+            weights = ops.mul(ops.gemm(x, self.weights_proj).float(), self.weight_scale)
+            return weights.to(torch.bfloat16)
+
     def __call__(
         self,
         ops: ModelOps,
         rope: RoPETable,
-        x: torch.Tensor,
         q: torch.Tensor,
+        weights: torch.Tensor | None,
         step: Step,
     ) -> torch.Tensor:
         """Return ``[1, S, index_topk]`` int32 indices of compressed entries, shifted by
         ``step.offset`` and padded with -1, for the queries ``q`` (``[S, n_heads *
         head_dim]``) that the attention's ``indexer_wq_b`` projects from its low-rank
-        queries."""
+        queries, under the head ``weights`` that ``pool`` returned for the call."""
         start_pos, seqlen = step.start_pos, step.seqlen
         q = q.view(1, seqlen, self.n_heads, self.head_dim)
         ops.rope(q[..., -self.rope_dim :], rope.cos, rope.sin, seqlen_offsets=step.starts)
         q = ops.hadamard(q)
         ops.fp4_fake_quant(q)
-        entries = self.compressor(ops, rope, x, step)
-        if entries is not None:
-            n = entries.shape[1]
-            codes, scales, _ = ops.act_quant(entries.view(n, self.head_dim))
-            if start_pos == 0:
-                self.cache[:, :n] = codes.view(1, n, 1, self.head_dim)
-                self.cache_scale[:, :n] = scales.view(1, n, 1)
-            else:
-                slot = (step.starts // self.ratio).long()
-                codes = codes.view(torch.uint8).view(1, 1, 1, self.head_dim)
-                self.cache.view(torch.uint8).index_copy_(1, slot, codes)
-                self.cache_scale.index_copy_(1, slot, scales.view(1, 1, 1))
-        if not step.has_entries(self.ratio):
+        ops.side.join(1)
+        ops.side.join(2)
+        if weights is None:
             return torch.full(
-                (1, seqlen, ops.index_topk.top_k), -1, dtype=torch.int32, device=x.device
+                (1, seqlen, ops.index_topk.top_k), -1, dtype=torch.int32, device=q.device
             )
         q, q_scale, _ = ops.act_quant(q.view(seqlen * self.n_heads, self.head_dim))
-        weights = ops.mul(ops.gemm(x, self.weights_proj).float(), self.weight_scale)
-        weights = ops.mul(weights.to(torch.bfloat16).float(), q_scale.view(seqlen, self.n_heads))
+        weights = ops.mul(weights.float(), q_scale.view(seqlen, self.n_heads))
         width = self._keys(seqlen // self.ratio) if start_pos == 0 else self.cache.shape[1]
         logits = ops.index_logits(
             q.view(1, seqlen, self.n_heads, self.head_dim),
@@ -321,6 +337,11 @@ class Attention:
     ``indexer_wq_b``, the indexer's query projection; each layer of a pair is a row view of its
     stack. A one-token call quantizes the input once and runs one GEMM for each pair, whose output
     columns lie in place; a longer call's would be strided, so it runs the two views.
+
+    A one-token call captured in a CUDA graph, whose kernels leave much of the device idle, runs
+    work beside its chain of projections and index selection on ``ops.side``: the compressor, the
+    indexer's pooling and its head weights from the input, the KV row's normalization, rotation
+    and quantization, and the queries'. Any other call runs them in turn.
     """
 
     def __init__(
@@ -366,32 +387,46 @@ class Attention:
         seqlen, start_pos = step.seqlen, step.start_pos
         win, rd = self.window, self.rope_dim
         one = seqlen == 1
+        side = ops.side
+        entries = weights = None
+        side.fork(one)
+        if self.compressor is not None:
+            with side.on(0):
+                entries = self.compressor(ops, rope, x, step)
+        if self.indexer is not None:
+            weights = self.indexer.pool(ops, rope, x, step)
         if one:
             q_kv = self.wq_a_kv(ops, x)
-            q_low, kv = q_kv[:, : self.q_rank], q_kv[:, self.q_rank :]
+            q_low, kv_proj = q_kv[:, : self.q_rank], q_kv[:, self.q_rank :]
         else:
-            q_low, kv = self.wq_a(ops, x), self.wkv(ops, x)
+            q_low, kv_proj = self.wq_a(ops, x), self.wkv(ops, x)
+        side.fork(one)
+        with side.on(2):
+            kv = ops.norm(kv_proj, self.kv_norm)
+            ops.rope(
+                kv.view(1, seqlen, 1, self.head_dim)[..., -rd:],
+                rope.cos,
+                rope.sin,
+                seqlen_offsets=step.starts,
+            )
+            ops.kv_fake_quant(kv[:, :-rd])
+            kv = kv.view(1, seqlen, self.head_dim)
+            if start_pos:
+                self.kv_cache.index_copy_(1, step.ring(), kv)
         qr = ops.norm(q_low, self.q_norm)
         if one and self.wq_b_index is not None:
             q_both = self.wq_b_index(ops, qr)
-            q, index_q = q_both[:, : self.q_width], q_both[:, self.q_width :]
+            q_proj, index_q = q_both[:, : self.q_width], q_both[:, self.q_width :]
         else:
-            q = self.wq_b(ops, qr)
+            q_proj = self.wq_b(ops, qr)
             index_q = self.indexer_wq_b(ops, qr) if self.indexer_wq_b is not None else None
-        q = ops.norm(q.view(1, seqlen, self.n_heads, self.head_dim), None)
-        ops.rope(q[..., -rd:], rope.cos, rope.sin, seqlen_offsets=step.starts)
-        kv = ops.norm(kv, self.kv_norm)
-        ops.rope(
-            kv.view(1, seqlen, 1, self.head_dim)[..., -rd:],
-            rope.cos,
-            rope.sin,
-            seqlen_offsets=step.starts,
-        )
-        ops.kv_fake_quant(kv[:, :-rd])
-        kv = kv.view(1, seqlen, self.head_dim)
+        side.fork(one)
+        with side.on(0):
+            q = ops.norm(q_proj.view(1, seqlen, self.n_heads, self.head_dim), None)
+            ops.rope(q[..., -rd:], rope.cos, rope.sin, seqlen_offsets=step.starts)
 
         if self.indexer is not None:
-            selected = self.indexer(ops, rope, x, index_q, step)[0]
+            selected = self.indexer(ops, rope, index_q, weights, step)[0]
             idx = torch.cat([step.window, selected], dim=-1).view(1, seqlen, 1, -1)
         elif self.ratio:
             width = seqlen // self.ratio if start_pos == 0 else self.max_entries
@@ -399,7 +434,8 @@ class Attention:
         else:
             idx = step.window.view(1, seqlen, 1, -1)
 
-        entries = self.compressor(ops, rope, x, step) if self.compressor is not None else None
+        side.join(0)
+        side.join(2)
         if start_pos == 0:
             first = max(0, seqlen - win)
             slot = first % win
@@ -411,7 +447,6 @@ class Attention:
                 self.kv_cache[:, win : win + entries.shape[1]] = entries
                 keys = torch.cat([kv, entries], dim=1)
         else:
-            self.kv_cache.index_copy_(1, step.ring(), kv)
             if entries is not None:
                 self.kv_cache.index_copy_(1, (win + step.starts // self.ratio).long(), entries)
             keys = self.kv_cache
@@ -432,7 +467,9 @@ class MoE:
 
     The first ``n_hash_layers`` route by a token-id table; the rest by ``score_func`` scores
     and a selection bias. The routing weights, times ``route_scale``, multiply the SwiGLU
-    output before the down projection, and the shared expert joins the float32 combine.
+    output before the down projection, and the shared expert joins the float32 combine. A
+    one-token call captured in a CUDA graph runs the shared expert on a side stream, its down
+    projection after the routed gate-up GEMM, which it would otherwise slow.
     """
 
     def __init__(self, cfg: DeepseekV4FlashConfig, layer_id: int) -> None:
@@ -449,6 +486,10 @@ class MoE:
 
     def __call__(self, ops: ModelOps, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         """Return the MoE output for ``x`` (``[T, dim]`` bfloat16) and its ``[T]`` token ids."""
+        one = x.shape[0] == 1
+        ops.side.fork(one)
+        with ops.side.on(0):
+            shared = ops.swiglu(self.shared_w13(ops, x))
         logits = ops.gemm_f32(x, self.gate)
         if self.hash:
             expert_ids = ops.embedding(input_ids, self.tid2eid)
@@ -458,12 +499,15 @@ class MoE:
         routed, metadata, inverse = ops.permute(x, ids)
         a, a_scale, _ = ops.act_quant_e8m0(routed)
         gate_up = ops.expert_gemm(a, a_scale, self.w13, self.w13_scale, metadata)
+        ops.side.fork(one)
+        with ops.side.on(0):
+            shared = self.shared_w2(ops, shared)
         row_weights = torch.empty(routed.shape[0], dtype=torch.float32, device=x.device)
         row_weights[inverse.long()] = weights.view(-1)
         hidden = ops.swiglu(gate_up, scale=row_weights)
         a, a_scale, _ = ops.act_quant_e8m0(hidden)
         expert_out = ops.expert_gemm(a, a_scale, self.w2, self.w2_scale, metadata)
-        shared = self.shared_w2(ops, ops.swiglu(self.shared_w13(ops, x)))
+        ops.side.join(0)
         return ops.unpermute(expert_out, torch.ones_like(weights), inverse, residual=shared)
 
 

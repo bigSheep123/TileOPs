@@ -29,7 +29,7 @@ class DeepseekV4FlashForCausalLM(CausalLM):
     def __init__(self, config: DeepseekV4FlashConfig, **options: Any) -> None:
         super().__init__(config, **options)
         max_seq_len = self.max_seq_len
-        self.ops = ModelOps(config)
+        self.ops = ModelOps(config, self.device)
         self.layers = [Block(config, i, max_seq_len, self.device) for i in range(config.n_layers)]
         self._ratios = tuple(sorted({layer.attn.ratio for layer in self.layers} - {0}))
         self._indexed_ratios = tuple(r for r in self._ratios if config.indexed(r))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 
 import torch
@@ -34,7 +35,48 @@ from tileops.sequence_modeling import (
 )
 from tileops.transform import HadamardTransformFwdOp
 
-__all__ = ["ModelOps", "RoPETable"]
+__all__ = ["ModelOps", "RoPETable", "SideStreams"]
+
+
+class SideStreams:
+    """Streams beside a device's current one, on which a captured graph runs work whose result
+    the current stream needs only later.
+
+    ``fork(parallel)`` marks the current stream's work so far. Until the next ``fork``, the work
+    of an ``on(i)`` block runs on side stream ``i`` after that mark, and ``join(i)`` makes the
+    current stream wait for all the work on side stream ``i``; the graph runs each block as a
+    branch beside the current stream's work. Forked with ``parallel`` False, or while the
+    current stream is not capturing a graph, the blocks run on the current stream and ``join``
+    waits for nothing. A fork's blocks must follow it directly, the tensors a block reads from
+    other streams' work must stay alive until its join, and the current stream reads a block's
+    outputs only after its join: then no stream reads a tensor unfinished, and the caching
+    allocator hands none to other work while a stream still reads it.
+    """
+
+    def __init__(self, device: torch.device, count: int) -> None:
+        self.device = device
+        self.streams = [torch.Stream(device) for _ in range(count)]
+        self._mark: torch.Event | None = None
+
+    def fork(self, parallel: bool) -> None:
+        """Mark the current stream's work so far, where the next blocks start if ``parallel``
+        and the current stream is capturing a graph."""
+        current = torch.accelerator.current_stream(self.device)
+        self._mark = current.record_event() if parallel and current.is_capturing() else None
+
+    def on(self, i: int) -> contextlib.AbstractContextManager:
+        """A block whose work runs on side stream ``i`` after the last fork's mark, or on the
+        current stream after a fork that marked nothing."""
+        if self._mark is None:
+            return contextlib.nullcontext()
+        stream = self.streams[i]
+        stream.wait_event(self._mark)
+        return stream
+
+    def join(self, i: int) -> None:
+        """Make the current stream wait for the work queued on side stream ``i``."""
+        if self._mark is not None:
+            torch.accelerator.current_stream(self.device).wait_stream(self.streams[i])
 
 
 class ModelOps:
@@ -44,10 +86,11 @@ class ModelOps:
     groups of 128 activations, 64 for the KV rows, with the group maximum floored at 1e-4. The
     mHC post mix is doubled, as the official ``hc_split_sinkhorn`` doubles it. The indexer's
     logits are undefined outside each query's window, which is all its top-k reads, and take
-    the key scales, ``act_quant``'s powers of two, as nonnegative.
+    the key scales, ``act_quant``'s powers of two, as nonnegative. ``side`` holds the three
+    streams on ``device`` on which a captured one-token call runs its independent work.
     """
 
-    def __init__(self, cfg: DeepseekV4FlashConfig) -> None:
+    def __init__(self, cfg: DeepseekV4FlashConfig, device: torch.device) -> None:
         eps = cfg.norm_eps
         floor = 1e-4
         layout = ContiguousLayoutSpec.tight_physical_psum()
@@ -100,6 +143,7 @@ class ModelOps:
         self.permute = MoEPrePermuteFwdOp(layout, cfg.n_routed_experts)
         self.expert_gemm = MoEGroupedGEMMMXFP4FwdOp(layout)
         self.unpermute = MoEPostPermuteFwdOp(layout)
+        self.side = SideStreams(device, 3)
 
     def norm(self, x: torch.Tensor, weight: torch.Tensor | None) -> torch.Tensor:
         """RMS-normalize the last axis of ``x``, scaled by ``weight`` when given."""
