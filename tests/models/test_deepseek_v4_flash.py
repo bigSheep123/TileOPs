@@ -162,7 +162,7 @@ def _check_decode_state(block, official_block, positions: int) -> None:
         pairs.append(("entries", attn.kv_cache[:, entries], official.kv_cache[:, entries], fp8_tol))
     if attn.indexer is not None and positions >= attn.indexer.ratio:
         n = positions // attn.indexer.ratio
-        actual = attn.indexer.cache[..., :n].transpose(1, 2)
+        actual = attn.indexer.cache[:, :n, 0].float() * attn.indexer.cache_scale[:, :n]
         expected = official.indexer.kv_cache[:, :n]
         pairs.append(("indexer entries", actual, expected, fp4_tol))
     for name, actual, expected, tol in pairs:
@@ -323,7 +323,9 @@ def test_decode_replays_the_eager_step_bitwise_in_every_phase(checkpoint, graph_
         for i, (mine, ref) in enumerate(zip(graph.layers, eager.layers, strict=True)):
             assert torch.equal(mine.attn.kv_cache, ref.attn.kv_cache), f"layer {i} KV cache"
             if ref.attn.indexer is not None:
-                assert torch.equal(mine.attn.indexer.cache, ref.attn.indexer.cache), f"layer {i}"
+                for name in ("cache", "cache_scale"):
+                    state = getattr(mine.attn.indexer, name), getattr(ref.attn.indexer, name)
+                    assert torch.equal(*state), f"layer {i} indexer {name}"
     decode_steps = sum(end - prompt_len for prompt_len, end in requests)
     assert graph_calls == {"capture_end": 4, "replay": decode_steps - 4}
 

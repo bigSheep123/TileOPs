@@ -7,8 +7,13 @@ import math
 import torch
 
 from models.deepseek_v4_flash.config import DeepseekV4FlashConfig
-from tileops.attention import DSADenseFwdOp, GatedPoolCompressFwdOp, TopKSelectFwdOp
-from tileops.elementwise import MulFwdOp, ReLUFwdOp, SiLUAndMulFwdOp
+from tileops.attention import (
+    DSADenseFwdOp,
+    FP8LightningIndexerFwdOp,
+    GatedPoolCompressFwdOp,
+    TopKSelectFwdOp,
+)
+from tileops.elementwise import MulFwdOp, SiLUAndMulFwdOp
 from tileops.gemm import BMMFwdOp, BMMW8A16FwdOp, GEMMFP8FwdOp, GEMMFwdOp
 from tileops.indexing import EmbeddingFwdOp
 from tileops.moe import (
@@ -37,7 +42,9 @@ class ModelOps:
 
     The FP8 quantizations are the official model's ``act_quant``: power-of-two scales over
     groups of 128 activations, 64 for the KV rows, with the group maximum floored at 1e-4. The
-    mHC post mix is doubled, as the official ``hc_split_sinkhorn`` doubles it.
+    mHC post mix is doubled, as the official ``hc_split_sinkhorn`` doubles it. The indexer's
+    logits are undefined outside each query's window, which is all its top-k reads, and take
+    the key scales, ``act_quant``'s powers of two, as nonnegative.
     """
 
     def __init__(self, cfg: DeepseekV4FlashConfig) -> None:
@@ -58,7 +65,6 @@ class ModelOps:
         self.bmm_w8a16 = BMMW8A16FwdOp()
         self.rope = RoPECosSinFwdOp(interleaved=True, inplace=True)
         self.hadamard = HadamardTransformFwdOp()
-        self.relu = ReLUFwdOp()
         self.mul = MulFwdOp()
         self.argmax = ArgmaxFwdOp(dim=-1)
         self.norms = {
@@ -71,6 +77,9 @@ class ModelOps:
             for r in set(cfg.compress_ratios)
             if r
         }
+        self.index_logits = FP8LightningIndexerFwdOp(
+            clean_logits=False, assume_nonnegative_scale=True
+        )
         self.index_topk = TopKSelectFwdOp(cfg.index_topk, fill_value=-1)
         self.hc_pre = HyperConnectionPreFwdOp(
             rms_eps=eps,

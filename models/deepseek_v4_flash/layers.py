@@ -224,8 +224,15 @@ class Compressor:
 class Indexer:
     """The lightning indexer: selects each query's top compressed entries of an indexed layer.
 
-    ``cache`` holds the entries as columns, ``[1, index_head_dim, max_entries]``, the layout the
-    scores' BMM reads, so a decode step reads it in place.
+    ``cache`` holds the entries as FP8 e4m3 rows, ``[1, n, 1, index_head_dim]``, and
+    ``cache_scale`` their power-of-two scales, ``[1, n, 1]``, the layout
+    ``FP8LightningIndexerFwdOp`` reads, so a decode step reads it in place; ``n`` is
+    ``_keys(max_entries)``. A query row is quantized the same way and its scale folded into its
+    head weight, which the ReLU commutes with, the scale being positive. A power-of-two row
+    scale keeps an FP4 fake-quantized row exact in FP8 while its block scales span at most 14
+    binades and none lies below 2^-30, ``act_quant``'s row scale being at least 2^-22; the
+    logits then leave out only the official indexer's bfloat16 rounding of the scores, the
+    weighted scores and the logits.
     """
 
     def __init__(
@@ -235,13 +242,22 @@ class Indexer:
         self.head_dim = cfg.index_head_dim
         self.rope_dim = cfg.rope_head_dim
         self.ratio = ratio
-        self.max_entries = max_entries
         self.compressor = Compressor(cfg, ratio, self.head_dim, rotate=True, device=device)
         self.weights_proj: torch.Tensor
         self.weight_scale = torch.tensor(
             [self.head_dim**-0.5 * self.n_heads**-0.5], dtype=torch.float32, device=device
         )
-        self.cache = torch.zeros(1, self.head_dim, max_entries, dtype=torch.bfloat16, device=device)
+        rows = self._keys(max_entries)
+        self.cache = torch.zeros(
+            1, rows, 1, self.head_dim, dtype=torch.float8_e4m3fn, device=device
+        )
+        self.cache_scale = torch.zeros(1, rows, 1, dtype=torch.float32, device=device)
+
+    @staticmethod
+    def _keys(entries: int) -> int:
+        """``entries`` rounded up to a multiple of four, the key counts the op's
+        warp-specialized kernel takes."""
+        return -(-entries // 4) * 4
 
     def __call__(
         self,
@@ -261,22 +277,33 @@ class Indexer:
         q = ops.hadamard(q)
         ops.fp4_fake_quant(q)
         entries = self.compressor(ops, rope, x, step)
-        if entries is not None and start_pos == 0:
-            self.cache[..., : entries.shape[1]] = entries.transpose(1, 2)
-        elif entries is not None:
-            self.cache.index_copy_(2, (step.starts // self.ratio).long(), entries.transpose(1, 2))
+        if entries is not None:
+            n = entries.shape[1]
+            codes, scales, _ = ops.act_quant(entries.view(n, self.head_dim))
+            if start_pos == 0:
+                self.cache[:, :n] = codes.view(1, n, 1, self.head_dim)
+                self.cache_scale[:, :n] = scales.view(1, n, 1)
+            else:
+                slot = (step.starts // self.ratio).long()
+                codes = codes.view(torch.uint8).view(1, 1, 1, self.head_dim)
+                self.cache.view(torch.uint8).index_copy_(1, slot, codes)
+                self.cache_scale.index_copy_(1, slot, scales.view(1, 1, 1))
         if not step.has_entries(self.ratio):
             return torch.full(
                 (1, seqlen, ops.index_topk.top_k), -1, dtype=torch.int32, device=x.device
             )
+        q, q_scale, _ = ops.act_quant(q.view(seqlen * self.n_heads, self.head_dim))
         weights = ops.mul(ops.gemm(x, self.weights_proj).float(), self.weight_scale)
-        weights = weights.to(torch.bfloat16)
-        width = seqlen // self.ratio if start_pos == 0 else self.max_entries
-        keys = self.cache[..., :width]
-        scores = ops.bmm(q.view(1, seqlen * self.n_heads, self.head_dim), keys)
-        scores = ops.relu(scores).view(seqlen, self.n_heads, width)
-        logits = ops.bmm(weights.view(seqlen, 1, self.n_heads), scores)
-        logits = logits.float().view(1, seqlen, width, 1)
+        weights = ops.mul(weights.to(torch.bfloat16).float(), q_scale.view(seqlen, self.n_heads))
+        width = self._keys(seqlen // self.ratio) if start_pos == 0 else self.cache.shape[1]
+        logits = ops.index_logits(
+            q.view(1, seqlen, self.n_heads, self.head_dim),
+            self.cache[:, :width],
+            weights,
+            step.first_entries().view(-1),
+            step.closed(self.ratio).view(-1),
+            self.cache_scale[:, :width],
+        )
         idx = ops.index_topk(logits, step.first_entries(), step.closed(self.ratio)).squeeze(2)
         return torch.where(idx >= 0, idx + step.offset, idx)
 
