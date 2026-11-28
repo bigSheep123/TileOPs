@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from tests.cuda_graph_contract import check_replay
+from tests.misaligned import misaligned
 from tests.state_pool_guard import check_padded_slots_skipped
 from tests.workload_test_base import TestBase
 from tileops._kernels.kernel_base import Kernel
@@ -268,8 +269,7 @@ def test_causal_conv1d_update_unaligned_state() -> None:
     """A state whose storage starts off a 16-byte boundary is advanced in place all the same."""
     batch, dim, width = 4, 256, 4
     dev, dtype = run_device(), torch.bfloat16
-    flat = torch.randn(batch * dim * (width - 1) + 1, device=dev, dtype=dtype)
-    state = flat[1:].view(batch, dim, width - 1)
+    state = misaligned(torch.randn(batch, dim, width - 1, device=dev, dtype=dtype))
     x = torch.randn(batch, dim, device=dev, dtype=dtype)
     weight = torch.rand(dim, width, device=dev, dtype=dtype) - 0.5
     expected_state = state.clone()

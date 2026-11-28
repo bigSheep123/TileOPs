@@ -5,7 +5,7 @@ import torch
 
 from tests.cuda_graph_contract import CapturedGraph, check_replay
 from tests.misaligned import misaligned
-from tests.workload_test_base import FixtureBase, TestBase
+from tests.workload_test_base import FixtureBase, TestBase, op_preferring
 from tileops._kernels.constants import BLOCK_SHARED_BYTES_OPT_IN
 from tileops._kernels.gemm import (
     GEMMINT8W8A8Call,
@@ -31,8 +31,6 @@ from tileops._kernels.gemm.w4a16 import (
 )
 from tileops._utils import calibration_key, get_sm_count
 from tileops.backend import BUILTIN
-from tileops.backend import _registry as registry
-from tileops.backend._registry import register_kernel_type
 from tileops.gemm import GEMMFP8FwdOp, GEMMFwdOp, GEMMINT8W8A8FwdOp, GEMMW4A8FwdOp, GEMMW4A16FwdOp
 from workloads.device import run_device
 from workloads.gemm import (
@@ -2642,12 +2640,9 @@ def test_gemm_cp_async_split_k_adds_the_bias_in_the_reduction(
         general = False
         preferred_over = frozenset(GEMMFwdOp.kernel_types)
 
-    state = registry.snapshot()
-    try:
-        register_kernel_type("GEMMFwdOp", "gemm_cp_async_pinned", Pinned)
-        op = GEMMFwdOp(out_dtype=out_dtype, target=BUILTIN)
-    finally:
-        registry.restore(state)
+    op = op_preferring(
+        GEMMFwdOp, "gemm_cp_async_pinned", Pinned, out_dtype=out_dtype, target=BUILTIN
+    )
     test = GEMMTest(256, 512, 1024, torch.bfloat16, False, True, bias=True, out_dtype=out_dtype)
     inputs = test.gen_inputs()
     op(*inputs)

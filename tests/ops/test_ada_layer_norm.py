@@ -4,16 +4,15 @@ import pytest
 import torch
 
 from tests.misaligned import misaligned
-from tests.ops.test_layer_norm import (
+from tests.ops.layer_norm_helpers import (
     assert_raw_sums_fail,
     check_held_launch,
     far_case,
-    op_preferring,
     outlier_case,
     outlier_rows,
     warp_leads,
 )
-from tests.workload_test_base import FixtureBase, TestBase, smoke_first
+from tests.workload_test_base import FixtureBase, TestBase, op_preferring, smoke_first
 from tileops._kernels.norm import (
     AdaLayerNormHeldKernel,
     AdaLayerNormKernel,

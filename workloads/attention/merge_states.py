@@ -74,13 +74,11 @@ class MergeAttentionStatesWorkload(WorkloadBase):
             inputs[1].div_(math.log(2))
             inputs[3].div_(math.log(2))
         if self.misaligned:
-            shifted = []
-            for x in inputs:
-                buffer = torch.empty(x.numel() + 1, dtype=x.dtype, device=device)
-                value = buffer[1:].view_as(x)
-                value.copy_(x)
-                shifted.append(value)
-            inputs = shifted
+            # Each input copied into storage that starts one element past a vector boundary.
+            inputs = [
+                torch.empty(x.numel() + 1, dtype=x.dtype, device=device)[1:].view_as(x).copy_(x)
+                for x in inputs
+            ]
         return tuple(inputs)
 
     def ref_program(self, v_a, s_a, v_b, s_b):

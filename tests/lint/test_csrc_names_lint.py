@@ -4,16 +4,15 @@ One case per way a csrc header can define a name outside ``namespace tileops`` o
 with a prefix the namespace replaces, against the layouts a conforming header uses.
 """
 
+import functools
 from pathlib import Path
 
 import csrc_names_lint as lint
 import pytest
 
+from tests.lint.lint_probe import probe_findings
 
-def _findings(tmp_path: Path, source: str) -> list[str]:
-    path = tmp_path / "probe.h"
-    path.write_text(source, encoding="utf-8")
-    return lint.findings(path)
+_findings = functools.partial(probe_findings, lint, name="probe.h")
 
 
 FLAGGED = [

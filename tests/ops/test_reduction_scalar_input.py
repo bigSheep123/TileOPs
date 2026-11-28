@@ -15,7 +15,7 @@ from tileops.manifest import load_adts, load_manifest
 from tileops.manifest._values import convert
 from workloads.device import run_device, run_device_available
 from workloads.numerics import compare_outputs
-from workloads.reduction import reduction_verification
+from workloads.reduction import reduction_reference, reduction_verification
 
 pytestmark = pytest.mark.skipif(
     not run_device_available(), reason="the run device is not available"
@@ -27,50 +27,40 @@ _ADTS = load_adts()
 _FLOAT_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 _DTYPE_IDS = ["fp16", "bf16", "fp32"]
 
-#: A 0-D input and the reference each op must match on it. ``prod`` takes no ``None``
-#: dim, so it is asked about an int one.
-_ARITHMETIC = [
-    pytest.param("SumFwdOp", torch.sum, id="sum"),
-    pytest.param("MeanFwdOp", torch.mean, id="mean"),
-    pytest.param("AmaxFwdOp", torch.amax, id="amax"),
-    pytest.param("AminFwdOp", torch.amin, id="amin"),
-]
+# ``prod`` takes no ``None`` dim, so it is asked about an int one.
+_ARITHMETIC = ["SumFwdOp", "MeanFwdOp", "AmaxFwdOp", "AminFwdOp"]
 _WELFORD = ["VarFwdOp", "StdFwdOp", "VarMeanFwdOp"]
 _LOGICAL = [
-    pytest.param("AllFwdOp", torch.all, torch.bool, id="all"),
-    pytest.param("AnyFwdOp", torch.any, torch.bool, id="any"),
-    pytest.param("CountNonzeroFwdOp", torch.count_nonzero, torch.int64, id="count-nonzero"),
+    pytest.param("AllFwdOp", torch.bool, id="all"),
+    pytest.param("AnyFwdOp", torch.bool, id="any"),
+    pytest.param("CountNonzeroFwdOp", torch.int64, id="count-nonzero"),
 ]
 
 
 def _op(name: str, **kwargs):
-    import tileops._ops.reduction.logical_reduce as logical
-    import tileops._ops.reduction.reduce as reduce_ops
+    import tileops._ops.reduction as reduction
 
-    module = logical if hasattr(logical, name) else reduce_ops
-    return getattr(module, name)(**kwargs)
+    return getattr(reduction, name)(**kwargs)
 
 
 def _as_tuple(value):
     return value if isinstance(value, tuple) else (value,)
 
 
-def _welford_ref(name: str, x, dim, keepdim):
-    fn = {"VarFwdOp": torch.var, "StdFwdOp": torch.std, "VarMeanFwdOp": torch.var_mean}[name]
-    out = fn(x.float(), dim=dim, keepdim=keepdim, correction=1)
-    return tuple(t.to(x.dtype) for t in _as_tuple(out))
+def _welford_ref(name: str, x, dim):
+    return _as_tuple(reduction_reference(name, x, {"dim": dim, "correction": 1}))
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize("op_name, torch_fn", _ARITHMETIC)
-def test_an_arithmetic_reduction_of_one_element_is_that_element(op_name, torch_fn) -> None:
+@pytest.mark.parametrize("op_name", _ARITHMETIC)
+def test_an_arithmetic_reduction_of_one_element_is_that_element(op_name) -> None:
     x = torch.tensor(1.5, dtype=torch.float16, device=run_device())
 
     y = _op(op_name, dim=None)(x)
 
-    ref = torch_fn(x.float(), dim=None).to(x.dtype)
+    ref = reduction_reference(op_name, x, {"dim": None})
     assert y.shape == ref.shape, f"{op_name}: {y.shape} vs {ref.shape}"
-    compare_outputs(y, ref, reduction_verification((ref).dtype, scalar=True))
+    compare_outputs(y, ref, reduction_verification(ref.dtype, scalar=True))
 
 
 @pytest.mark.smoke
@@ -82,10 +72,10 @@ def test_the_scalar_path_honours_dtype_and_keepdim(dtype, keepdim) -> None:
 
     y = _op("SumFwdOp", dim=None, keepdim=keepdim)(x)
 
-    ref = torch.sum(x.float(), dim=None, keepdim=keepdim).to(dtype)
+    ref = reduction_reference("SumFwdOp", x, {"dim": None, "keepdim": keepdim})
     assert y.shape == ref.shape
     assert y.dtype == dtype
-    compare_outputs(y, ref, reduction_verification((ref).dtype, scalar=True))
+    compare_outputs(y, ref, reduction_verification(ref.dtype, scalar=True))
 
 
 @pytest.mark.smoke
@@ -96,9 +86,9 @@ def test_prod_of_one_element_is_that_element(dim) -> None:
 
     y = _op("ProdFwdOp", dim=dim)(x)
 
-    ref = torch.prod(x.float(), dim=dim).to(x.dtype)
+    ref = reduction_reference("ProdFwdOp", x, {"dim": dim})
     assert y.shape == ref.shape
-    compare_outputs(y, ref, reduction_verification((ref).dtype, scalar=True))
+    compare_outputs(y, ref, reduction_verification(ref.dtype, scalar=True))
 
 
 def _warns_dof(fn) -> tuple[object, bool]:
@@ -119,12 +109,12 @@ def test_a_welford_reduction_of_one_element_matches_torch(op_name) -> None:
     x = torch.tensor(1.5, dtype=torch.float16, device=run_device())
 
     got, op_warned = _warns_dof(lambda: _as_tuple(_op(op_name, dim=None)(x)))
-    want, ref_warned = _warns_dof(lambda: _welford_ref(op_name, x, None, False))
+    want, ref_warned = _warns_dof(lambda: _welford_ref(op_name, x, None))
 
     assert op_warned == ref_warned, f"{op_name}: warned {op_warned}, torch {ref_warned}"
     for g, w in zip(got, want, strict=True):
         assert g.shape == w.shape, f"{op_name}: {g.shape} vs {w.shape}"
-        compare_outputs(g, w, reduction_verification((w).dtype, scalar=True))
+        compare_outputs(g, w, reduction_verification(w.dtype, scalar=True))
 
 
 @pytest.mark.smoke
@@ -141,25 +131,23 @@ def test_a_reduction_with_no_degrees_of_freedom_matches_torch(op_name, shape, di
 
     got = _as_tuple(_op(op_name, dim=dim)(x))
 
-    for g, w in zip(got, _welford_ref(op_name, x, dim, False), strict=True):
-        compare_outputs(g, w, reduction_verification((w).dtype, scalar=True))
+    for g, w in zip(got, _welford_ref(op_name, x, dim), strict=True):
+        compare_outputs(g, w, reduction_verification(w.dtype, scalar=True))
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize("op_name, torch_fn, out_dtype", _LOGICAL)
+@pytest.mark.parametrize("op_name, out_dtype", _LOGICAL)
 @pytest.mark.parametrize("value", [0.0, 1.5], ids=["zero", "nonzero"])
-def test_a_logical_reduction_of_one_element_matches_torch(
-    op_name, torch_fn, out_dtype, value
-) -> None:
+def test_a_logical_reduction_of_one_element_matches_torch(op_name, out_dtype, value) -> None:
     """Both truth values, because the predicate is what these ops compute."""
     x = torch.tensor(value, dtype=torch.float16, device=run_device())
 
     y = _op(op_name, dim=None)(x)
 
-    ref = torch_fn(x, dim=None)
+    ref = reduction_reference(op_name, x, {"dim": None})
     assert y.dtype == out_dtype, f"{op_name}: {y.dtype}"
     assert y.shape == ref.shape, f"{op_name}: {y.shape} vs {ref.shape}"
-    compare_outputs(y, ref, reduction_verification((ref).dtype, scalar=True))
+    compare_outputs(y, ref, reduction_verification(ref.dtype, scalar=True))
 
 
 @pytest.mark.smoke
@@ -191,22 +179,20 @@ def test_a_welford_scalar_keeps_autograd_history(op_name) -> None:
 
 @pytest.mark.smoke
 @pytest.mark.parametrize(
-    "name, ref",
+    "name, params",
     [
-        ("SoftmaxFwdOp", lambda x: torch.softmax(x, 0)),
-        ("LogSoftmaxFwdOp", lambda x: torch.log_softmax(x, 0)),
-        ("LogSumExpFwdOp", lambda x: torch.logsumexp(x, 0)),
-        ("ArgmaxFwdOp", lambda x: torch.argmax(x, 0)),
-        ("VectorNormFwdOp", lambda x: torch.linalg.vector_norm(x, 2, 0)),
+        ("SoftmaxFwdOp", {}),
+        ("LogSoftmaxFwdOp", {}),
+        ("LogSumExpFwdOp", {}),
+        ("ArgmaxFwdOp", {}),
+        ("VectorNormFwdOp", {"ord": 2}),
     ],
 )
-def test_a_scalar_input_to_an_axis_op_matches_torch(name: str, ref) -> None:
-    import tileops.reduction as reduction
-
+def test_a_scalar_input_to_an_axis_op_matches_torch(name: str, params) -> None:
     x = torch.tensor(-1.5, dtype=torch.float32, device=run_device())
-    want = ref(x)
+    want = reduction_reference(name, x, {"dim": 0, **params})
     compare_outputs(
-        getattr(reduction, name)(dim=0)(x), want, reduction_verification(want.dtype, scalar=True)
+        _op(name, dim=0, **params)(x), want, reduction_verification(want.dtype, scalar=True)
     )
 
 

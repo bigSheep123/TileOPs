@@ -5,6 +5,7 @@ over one int dim; the variance ops also over a tuple and ``None``. Other ``dim``
 import pytest
 import torch
 
+from tests.misaligned import misaligned
 from tests.workload_test_base import TestBase
 from tileops._ops.reduction import (
     AmaxFwdOp,
@@ -25,7 +26,7 @@ from workloads.reduction import (
     ReduceCase,
     VarianceConstantCase,
     WelfordCase,
-    _reduction_reference,
+    reduction_reference,
     reduction_verification,
 )
 
@@ -258,7 +259,7 @@ def test_reduce_tiled_autotune(op_kind: str) -> None:
 def _check(op, x: torch.Tensor, **params) -> None:
     """Compare every output of *op* on *x* with the reduction oracle at *params*."""
     out = op(x)
-    ref = _reduction_reference(type(op).__name__, x, params)
+    ref = reduction_reference(type(op).__name__, x, params)
     pairs = zip(out, ref, strict=True) if isinstance(ref, tuple) else [(out, ref)]
     for got, want in pairs:
         assert got.shape == want.shape, f"shape {got.shape} vs ref {want.shape}"
@@ -321,17 +322,12 @@ def test_reduce_views(op_kind: str, view: str) -> None:
 def test_reduce_view_off_vector_boundary() -> None:
     """A contiguous view whose storage starts off a 16-byte boundary reduces correctly."""
 
-    flat = torch.rand(4 * 4096 + 1, dtype=torch.float16, device=run_device()) * 0.001 + 1
-    x = flat[1:].view(4, 4096)
+    x = misaligned(torch.rand(4, 4096, dtype=torch.float16, device=run_device()) * 0.001 + 1)
     assert x.is_contiguous() and x.data_ptr() % 16
 
-    for op, ref in ((SumFwdOp(dim=-1), torch.sum), (ProdFwdOp(dim=-1), torch.prod)):
-        y = op(x)
-        compare_outputs(
-            y,
-            ref(x.float(), dim=-1).half(),
-            reduction_verification(torch.float16),
-        )
+    for op in (SumFwdOp(dim=-1), ProdFwdOp(dim=-1)):
+        ref = reduction_reference(type(op).__name__, x, {"dim": -1})
+        compare_outputs(op(x), ref, reduction_verification(torch.float16))
 
 
 @pytest.mark.smoke
@@ -348,18 +344,17 @@ def test_reduce_view_off_vector_boundary() -> None:
 def test_dtype_casts_the_input_before_reducing(name, in_dtype, out_dtype) -> None:
     """``dtype`` casts the input first and is the output's, as in torch."""
 
-    op, ref_fn = {
-        "sum": (SumFwdOp(dim=-1, dtype=out_dtype), lambda x: torch.sum(x, -1, dtype=out_dtype)),
-        "prod": (ProdFwdOp(-1, dtype=out_dtype), lambda x: torch.prod(x, -1, dtype=out_dtype)),
-        "l2": (
-            VectorNormFwdOp(2, dim=-1, dtype=out_dtype),
-            lambda x: torch.linalg.vector_norm(x, 2, -1, dtype=out_dtype),
-        ),
+    op = {
+        "sum": SumFwdOp(dim=-1, dtype=out_dtype),
+        "prod": ProdFwdOp(-1, dtype=out_dtype),
+        "l2": VectorNormFwdOp(2, dim=-1, dtype=out_dtype),
     }[name]
     x = torch.rand(8, 512, device=run_device()).mul(0.01).add(0.995).to(in_dtype)
+    params = {"dim": -1, "ord": 2, "dtype": str(out_dtype).removeprefix("torch.")}
     got = op(x)
     assert got.dtype == out_dtype
-    compare_outputs(got, ref_fn(x), reduction_verification(out_dtype))
+    want = reduction_reference(type(op).__name__, x, params, native=True)
+    compare_outputs(got, want, reduction_verification(out_dtype))
 
 
 _VARIANCE_DIMS = [
@@ -434,19 +429,12 @@ def test_variance_over_an_unaligned_innermost_dim_matches_torch(op_kind, dim) ->
 @pytest.mark.smoke
 @pytest.mark.filterwarnings("ignore:.*degrees of freedom:UserWarning")
 @pytest.mark.parametrize("correction", [0.5, 2, 3])
-@pytest.mark.parametrize("op_cls, ref_fn", [(VarFwdOp, torch.var), (StdFwdOp, torch.std)])
-def test_a_fractional_or_excess_variance_correction_matches_torch(
-    op_cls, ref_fn, correction
-) -> None:
+@pytest.mark.parametrize("op_cls", [VarFwdOp, StdFwdOp])
+def test_a_fractional_or_excess_variance_correction_matches_torch(op_cls, correction) -> None:
     """torch divides by ``max(0, n - correction)``: a spread over no degrees of freedom is
     ``inf``, including one too small for the storage dtype, and no spread is NaN."""
     x = torch.tensor([[0.0, 1e-4], [1.0, 1.0]], dtype=torch.float16, device=run_device())
-    got = op_cls(dim=1, correction=correction)(x)
-    compare_outputs(
-        got,
-        ref_fn(x, dim=1, correction=correction),
-        reduction_verification(x.dtype),
-    )
+    _check(op_cls(dim=1, correction=correction), x, dim=1, correction=correction)
 
 
 @pytest.mark.in_tree_kernels

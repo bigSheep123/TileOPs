@@ -196,8 +196,8 @@ _REFERENCES = {
     ),
     "PReLUFwdOp": _in_float32(lambda a, x, w: F.prelu(x, w)),
     "MaskedFillFwdOp": lambda a, x, m, v: x.masked_fill(m, v),
-    "AddFwdOp": _in_float32(lambda a, x, y: torch.add(x, y, alpha=a.get("alpha", 1.0))),
-    "SubFwdOp": _in_float32(lambda a, x, y: torch.sub(x, y, alpha=a.get("alpha", 1.0))),
+    "AddFwdOp": _in_float32(lambda a, x, y: torch.add(x, y, alpha=a.get("alpha", 1))),
+    "SubFwdOp": _in_float32(lambda a, x, y: torch.sub(x, y, alpha=a.get("alpha", 1))),
     "MulFwdOp": _in_float32(lambda a, x, y: torch.mul(x, y)),
     "DivFwdOp": _in_float32(
         lambda a, x, y: torch.div(x, y, rounding_mode=a.get("rounding_mode", None)),

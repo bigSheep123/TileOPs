@@ -7,6 +7,7 @@ A case builds its inputs from the op's own workload where there is one.
 
 import functools
 from collections.abc import Callable
+from math import inf
 from typing import NamedTuple
 
 import pytest
@@ -67,6 +68,19 @@ from tileops._ops.mamba.ssd_chunk_scan import SSDChunkScanFwdOp
 from tileops._ops.mamba.ssd_chunk_state import SSDChunkStateFwdOp
 from tileops._ops.mamba.ssd_recurrent import SSDRecurrentFwdOp
 from tileops._ops.mamba.ssd_state_passing import SSDStatePassingFwdOp
+from tileops._ops.norm import (
+    AdaLayerNormFwdOp,
+    AdaLayerNormZeroFwdOp,
+    BatchNormBwdOp,
+    BatchNormFwdOp,
+    FusedAddLayerNormFwdOp,
+    FusedAddRMSNormFwdOp,
+    FusedAddRMSNormPerTokenQuantFwdOp,
+    GroupNormFwdOp,
+    InstanceNormFwdOp,
+    LayerNormFwdOp,
+    RMSNormGatedFwdOp,
+)
 from tileops._ops.pool.mean_pooling import MeanPoolingFwdOp
 from tileops._ops.quantization import (
     FP8QuantPerBlockFwdOp,
@@ -81,6 +95,27 @@ from tileops._ops.quantization import (
 )
 from tileops._ops.quantization.fp4_quant import FP4QuantPerGroupFwdOp
 from tileops._ops.quantization.fp8_quant import FP8QuantPerTokenGroupFwdOp
+from tileops._ops.reduction import (
+    AllFwdOp,
+    AmaxFwdOp,
+    AminFwdOp,
+    AnyFwdOp,
+    ArgmaxFwdOp,
+    ArgminFwdOp,
+    CountNonzeroFwdOp,
+    CumprodFwdOp,
+    CumsumFwdOp,
+    LogSoftmaxFwdOp,
+    LogSumExpFwdOp,
+    MeanFwdOp,
+    ProdFwdOp,
+    SoftmaxFwdOp,
+    StdFwdOp,
+    SumFwdOp,
+    VarFwdOp,
+    VarMeanFwdOp,
+    VectorNormFwdOp,
+)
 from tileops._ops.rope import (
     LongRoPEFwdOp,
     RoPECosSinFwdOp,
@@ -932,11 +967,124 @@ def _rope_cases():
     )
 
 
+def _norm_cases():
+    """The norm ops except RMSNorm, which has its own module. A builder returns
+    ``(op, inputs)`` or ``(op, inputs, keyword inputs)``."""
+    _DTYPE = torch.float16
+    n = 256
+
+    def x(*shape, dtype=_DTYPE):
+        return torch.randn(*shape, dtype=dtype, device=run_device())
+
+    def batch_norm(training):
+        def build():
+            f32 = torch.float32
+            stats = (x(4, dtype=f32).abs(), x(4, dtype=f32).abs(), x(4, dtype=f32), x(4, dtype=f32))
+            return BatchNormFwdOp(training=training), (x(2, 4, 8, 8), *stats)
+
+        return build
+
+    def batch_norm_bwd():
+        f32 = torch.float32
+        inputs = (x(2, 4, 8, 8), x(2, 4, 8, 8), x(4, dtype=f32), x(4, dtype=f32).abs())
+        return BatchNormBwdOp(), inputs, {"weight": x(4, dtype=f32)}
+
+    return (
+        ("layer-norm", lambda: (LayerNormFwdOp(normalized_shape=(n,)), (x(8, n), x(n), x(n)))),
+        ("ada-layer-norm", lambda: (AdaLayerNormFwdOp(), (x(8, n), x(8, n), x(8, n)))),
+        (
+            "ada-layer-norm-zero",
+            lambda: (AdaLayerNormZeroFwdOp(), (x(8, n), x(8, n), x(8, n), x(8, n))),
+        ),
+        (
+            "fused-add-layer-norm",
+            lambda: (FusedAddLayerNormFwdOp(), (x(8, n), x(8, n), x(n), x(n))),
+        ),
+        ("fused-add-rms-norm", lambda: (FusedAddRMSNormFwdOp(), (x(8, n), x(8, n), x(n)))),
+        (
+            "fused-add-rms-norm-per-token-quant",
+            lambda: (FusedAddRMSNormPerTokenQuantFwdOp(), (x(8, n), x(8, n), x(n))),
+        ),
+        ("rms-norm-gated", lambda: (RMSNormGatedFwdOp(), (x(8, n), x(n), None, x(8, n)))),
+        ("group-norm", lambda: (GroupNormFwdOp(num_groups=2), (x(2, 4, 8, 8), x(4), x(4)))),
+        ("group-norm-no-affine", lambda: (GroupNormFwdOp(num_groups=2), (x(2, 4, 8, 8),))),
+        (
+            "instance-norm",
+            lambda: (InstanceNormFwdOp(), (x(2, 4, 8, 8), None, None, x(4), x(4))),
+        ),
+        # Training writes the running statistics, an input.
+        ("batch-norm-infer", batch_norm(False)),
+        ("batch-norm-train", batch_norm(True)),
+        ("batch-norm-bwd", batch_norm_bwd),
+    )
+
+
+def _reduction_cases():
+    """The reduction ops. ``dim`` is spelled out in every case: left implicit, softmax
+    resolves it by PyTorch's rule and logsumexp reduces everything, and either keeps the
+    output shape while changing the values."""
+    rows = (8, 256)
+
+    def one_tensor(op_cls, *args, **kwargs):
+        def build():
+            x = torch.randn(*rows, dtype=torch.float16, device=run_device())
+            return op_cls(*args, **kwargs), (x,)
+
+        return build
+
+    def all_empty_dim_bool():
+        # dim=[] is a no-op, and a bool input makes the cast to bool one too, so the
+        # result must still be a tensor of its own.
+        x = torch.randint(2, rows, dtype=torch.bool, device=run_device())
+        return AllFwdOp(dim=[]), (x,)
+
+    return (
+        # A reduced last axis, then a reduced leading one: the second is the case whose
+        # rows the kernel has to permute for.
+        ("sum", one_tensor(SumFwdOp, dim=-1)),
+        ("sum-leading-axis", one_tensor(SumFwdOp, dim=0)),
+        ("sum-keepdim", one_tensor(SumFwdOp, dim=-1, keepdim=True)),
+        ("sum-full", one_tensor(SumFwdOp, dim=None)),
+        ("mean", one_tensor(MeanFwdOp, dim=-1)),
+        ("amin", one_tensor(AminFwdOp, dim=-1)),
+        ("amax", one_tensor(AmaxFwdOp, dim=-1)),
+        ("prod", one_tensor(ProdFwdOp, dim=-1)),
+        ("std", one_tensor(StdFwdOp, dim=-1)),
+        ("var", one_tensor(VarFwdOp, dim=-1)),
+        # Two outputs, so two names in the fake and a getitem per result in the graph.
+        ("var-mean", one_tensor(VarMeanFwdOp, dim=-1)),
+        ("argmax", one_tensor(ArgmaxFwdOp, dim=-1)),
+        ("argmin", one_tensor(ArgminFwdOp, dim=-1)),
+        # A non-contiguous reduced axis, which argreduce strides along instead of transposing.
+        ("argmax-strided-axis", one_tensor(ArgmaxFwdOp, dim=0)),
+        # bool out, not the input dtype: the fake reads the manifest, not the input.
+        ("all", one_tensor(AllFwdOp, dim=-1)),
+        ("all-empty-dim-bool", all_empty_dim_bool),
+        ("any", one_tensor(AnyFwdOp, dim=-1)),
+        # int64 out.
+        ("count-nonzero", one_tensor(CountNonzeroFwdOp, dim=-1)),
+        ("l1-norm", one_tensor(VectorNormFwdOp, 1, dim=-1)),
+        ("l2-norm", one_tensor(VectorNormFwdOp, 2, dim=-1)),
+        ("inf-norm", one_tensor(VectorNormFwdOp, inf, dim=-1)),
+        ("softmax", one_tensor(SoftmaxFwdOp, dim=-1)),
+        # A same-shape result over a non-last axis comes back through a permute, so its
+        # strides have to match what the fake promised.
+        ("softmax-leading-axis", one_tensor(SoftmaxFwdOp, dim=0)),
+        ("log-softmax", one_tensor(LogSoftmaxFwdOp, dim=-1)),
+        ("logsumexp", one_tensor(LogSumExpFwdOp, dim=-1)),
+        ("cumsum", one_tensor(CumsumFwdOp, dim=-1)),
+        ("cumsum-leading-axis", one_tensor(CumsumFwdOp, dim=0)),
+        ("cumprod", one_tensor(CumprodFwdOp, dim=-1)),
+    )
+
+
 _FAMILIES = (
     _attention_cases,
     _gemm_cases,
     _mamba_cases,
     _linear_attention_cases,
+    _norm_cases,
+    _reduction_cases,
     _sampling_cases,
     _sequence_modeling_cases,
     _rope_cases,
@@ -945,7 +1093,8 @@ _FAMILIES = (
 
 
 class _Case(NamedTuple):
-    """One op's case. ``exact`` is False where the kernel returns a tensor a compiled call
+    """One op's case. ``build`` returns ``(op, inputs)`` or ``(op, inputs, keyword
+    inputs)``. ``exact`` is False where the kernel returns a tensor a compiled call
     cannot be held equal to; the contract there is the traced graph plus the shapes and
     dtypes the op promises. ``marks`` are its pytest marks, such as the architecture its
     kernel needs."""
@@ -954,6 +1103,12 @@ class _Case(NamedTuple):
     build: Callable[[], tuple]
     exact: bool = True
     marks: tuple = ()
+
+
+def _built(case: _Case) -> tuple:
+    """``case``'s op, positional inputs and keyword inputs."""
+    op, inputs, *keywords = case.build()
+    return op, inputs, dict(*keywords)
 
 
 def _cases():
@@ -1044,15 +1199,50 @@ for _op_cls in (
     RoPECosSinFwdOp,
     TopKMaskFwdOp,
     TopKTopPMaskFwdOp,
+    LayerNormFwdOp,
+    AdaLayerNormFwdOp,
+    AdaLayerNormZeroFwdOp,
+    FusedAddLayerNormFwdOp,
+    FusedAddRMSNormFwdOp,
+    FusedAddRMSNormPerTokenQuantFwdOp,
+    RMSNormGatedFwdOp,
+    GroupNormFwdOp,
+    InstanceNormFwdOp,
+    BatchNormFwdOp,
+    BatchNormBwdOp,
+    SumFwdOp,
+    MeanFwdOp,
+    AminFwdOp,
+    AmaxFwdOp,
+    ProdFwdOp,
+    StdFwdOp,
+    VarFwdOp,
+    VarMeanFwdOp,
+    ArgmaxFwdOp,
+    ArgminFwdOp,
+    AllFwdOp,
+    AnyFwdOp,
+    CountNonzeroFwdOp,
+    VectorNormFwdOp,
+    SoftmaxFwdOp,
+    LogSoftmaxFwdOp,
+    LogSumExpFwdOp,
+    CumsumFwdOp,
+    CumprodFwdOp,
 ):
     register_compile_contract(_op_cls)
 
 
-def _detached(inputs: tuple, clone: bool = False) -> tuple:
-    """``inputs`` without autograd history: a backward op's operator has no autograd formula."""
-    return tuple(
-        None if t is None else (t.detach().clone() if clone else t.detach()) for t in inputs
-    )
+def _detached(inputs, clone: bool = False):
+    """``inputs`` without autograd history: a backward op's operator has no autograd formula.
+    ``inputs`` is a tuple or a dict of keyword inputs."""
+
+    def detach(t):
+        return None if t is None else (t.detach().clone() if clone else t.detach())
+
+    if isinstance(inputs, dict):
+        return {k: detach(t) for k, t in inputs.items()}
+    return tuple(detach(t) for t in inputs)
 
 
 @pytest.mark.smoke
@@ -1060,11 +1250,19 @@ def _detached(inputs: tuple, clone: bool = False) -> tuple:
 @pytest.mark.parametrize("case", _cases())
 def test_a_cold_op_traces_fullgraph_and_matches_eager(case) -> None:
     """Cold is the whole contract: a warm op has nothing left for dynamo to trace into."""
-    op, inputs = case.build()
-    # Its own copies per call: a paged op writes its cache pages.
-    compiled = torch.compile(op, fullgraph=True)(*_detached(inputs, clone=True))
+    op, inputs, keywords = _built(case)
+    # Each call gets its own copies: an op that writes an input (a paged cache, BatchNorm's
+    # running statistics) would otherwise hand the second call a different starting state.
+    compiled_inputs, compiled_keywords = _detached(inputs, True), _detached(keywords, True)
+    eager_inputs, eager_keywords = _detached(inputs, True), _detached(keywords, True)
 
-    assert_same_result(compiled, op(*_detached(inputs, clone=True)), exact=case.exact)
+    compiled = torch.compile(op, fullgraph=True)(*compiled_inputs, **compiled_keywords)
+
+    assert_same_result(compiled, op(*eager_inputs, **eager_keywords), exact=case.exact)
+    if case.exact:
+        # An input the op writes must come out of the compiled call holding what eager left.
+        torch.testing.assert_close(compiled_inputs, eager_inputs)
+        torch.testing.assert_close(compiled_keywords, eager_keywords)
 
 
 @pytest.mark.smoke
@@ -1072,8 +1270,8 @@ def test_a_cold_op_traces_fullgraph_and_matches_eager(case) -> None:
 @pytest.mark.parametrize("case", _cases())
 def test_the_fake_reports_what_the_op_returns(case) -> None:
     """The fake is the op's whole promise to the compiler, so it must be the truth."""
-    op, inputs = case.build()
-    assert_fake_matches_eager(op, *_detached(inputs))
+    op, inputs, keywords = _built(case)
+    assert_fake_matches_eager(op, *_detached(inputs), **_detached(keywords))
 
 
 @pytest.mark.smoke
@@ -1081,5 +1279,5 @@ def test_the_fake_reports_what_the_op_returns(case) -> None:
 @pytest.mark.parametrize("case", _cases())
 def test_the_traced_graph_holds_only_this_ops_operator(case) -> None:
     """The node is the op's, so replacing the kernel cannot change the graph."""
-    op, inputs = case.build()
-    assert_op_owns_graph_nodes(op, *_detached(inputs))
+    op, inputs, keywords = _built(case)
+    assert_op_owns_graph_nodes(op, *_detached(inputs), **_detached(keywords))

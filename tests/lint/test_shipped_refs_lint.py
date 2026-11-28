@@ -5,16 +5,17 @@ fixture string — never on the live repo. Violating tokens are assembled by
 concatenation so this test file itself stays clean under the hook.
 """
 
+import functools
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
+from tests.lint.lint_probe import LINT_DIR, run_lint_script
+
 pytestmark = pytest.mark.smoke
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-LINT_SCRIPT = REPO_ROOT / "scripts" / "lint" / "shipped_refs_lint.py"
+LINT_SCRIPT = LINT_DIR / "shipped_refs_lint.py"
 
 # Concatenated so the literals never appear verbatim in this file.
 ISSUE_REF = "#" + "12345"
@@ -24,14 +25,7 @@ ROUND_REVIEW = "round" + "-2 review"
 FOLLOW_UP = "Follow" + "-up: #" + "12345"
 
 
-def run_lint(tmp_path: Path, content: str) -> subprocess.CompletedProcess:
-    target = tmp_path / "fixture.py"
-    target.write_text(content)
-    return subprocess.run(
-        [sys.executable, str(LINT_SCRIPT), str(target)],
-        capture_output=True,
-        text=True,
-    )
+run_lint = functools.partial(run_lint_script, "shipped_refs_lint.py")
 
 
 def test_issue_number_reference_fails(tmp_path):

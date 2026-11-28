@@ -5,16 +5,15 @@ which is a constant and is spelled ``UPPER_SNAKE``, against everything that only
 one.
 """
 
+import functools
 from pathlib import Path
 
 import module_constant_lint as lint
 import pytest
 
+from tests.lint.lint_probe import probe_findings
 
-def _findings(tmp_path: Path, source: str) -> list[str]:
-    path = tmp_path / "probe.py"
-    path.write_text(source, encoding="utf-8")
-    return lint.findings(path)
+_findings = functools.partial(probe_findings, lint)
 
 
 FLAGGED = [

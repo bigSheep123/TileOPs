@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from tests.cuda_graph_contract import CapturedGraph, check_replay
+from tests.misaligned import misaligned
 from tests.workload_test_base import TestBase
 from tileops.rope import RoPECosSinFwdOp
 from workloads.device import run_device
@@ -530,9 +531,7 @@ def test_rope_query_off_a_vector_boundary(neox) -> None:
     op, params = _op("RoPEFwdOp", dtype, is_neox_style=neox)
     positions, aligned, _ = _inputs("RoPEFwdOp", params, 8192, 8, None, dtype)
     positions = positions % params["max_position_embeddings"]
-    query = torch.empty(aligned.numel() + 1, device=run_device(), dtype=dtype)[1:]
-    query = query.view(aligned.shape).copy_(aligned)
-    got_q, _ = op(positions, query)
+    got_q, _ = op(positions, misaligned(aligned))
     compare_outputs(
         got_q, _reference("RoPEFwdOp", params, positions, aligned, None)[0], rope_verification()
     )

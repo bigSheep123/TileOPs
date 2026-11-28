@@ -8,6 +8,7 @@ Philox stream need not match the reference's.
 import pytest
 import torch
 
+from tests.misaligned import misaligned
 from tests.workload_test_base import TestBase
 from tileops.backend import OpNotAvailableError
 from tileops.sampling import (
@@ -546,8 +547,7 @@ def test_probabilities_off_a_vector_boundary_give_the_aligned_result(cls):
     want = _run(cls(), *inputs)
     # The float inputs a row is read from: chain speculative sampling's draft and target.
     for i in (0, 2) if cls is ChainSpeculativeSamplingFwdOp else (0,):
-        moved = torch.empty(inputs[i].numel() + 1, dtype=inputs[i].dtype, device=run_device())
-        inputs[i] = moved[1:].copy_(inputs[i].reshape(-1)).view(inputs[i].shape)
+        inputs[i] = misaligned(inputs[i])
     got = cls()(*inputs)
     if isinstance(want, tuple):
         assert all(map(torch.equal, got, want))

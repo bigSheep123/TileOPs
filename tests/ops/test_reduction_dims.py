@@ -13,6 +13,7 @@ import math
 import pytest
 import torch
 
+from tests.misaligned import misaligned
 from tileops._ops.reduction import (
     AllFwdOp,
     AmaxFwdOp,
@@ -32,7 +33,7 @@ from workloads.device import run_device
 from workloads.numerics import compare_outputs
 from workloads.reduction import (
     LogSumExpCase,
-    _reduction_reference,
+    reduction_reference,
     reduction_tolerance,
     reduction_verification,
     vector_norm_verification,
@@ -79,7 +80,7 @@ def _check(name: str, x: torch.Tensor, dim, keepdim: bool = False) -> None:
     y = _build(name, dim=dim, keepdim=keepdim)(x)
     # torch.amax and torch.logsumexp take no dim=None.
     axes = list(range(x.ndim)) if dim is None else dim
-    ref = _reduction_reference(
+    ref = reduction_reference(
         op_cls.__name__, x, dict(extra, dim=axes, keepdim=keepdim, correction=None)
     )
     if name == "logsumexp":
@@ -188,7 +189,7 @@ def test_logsumexp_edge_axes_special_values() -> None:
     x[:, 0, :] = float("-inf")
     x[2, 1, 7] = float("nan")
     y = LogSumExpFwdOp(dim=[0, 2])(x)
-    ref = torch.logsumexp(x.float(), dim=[0, 2]).to(x.dtype)
+    ref = reduction_reference("LogSumExpFwdOp", x, {"dim": [0, 2]})
     assert y[0].item() == float("-inf")
     assert torch.isnan(y[1])
     finite = torch.isfinite(ref)
@@ -201,7 +202,7 @@ def test_negative_dims_accepted() -> None:
 
     x = torch.randn(4, 8, 256, dtype=torch.float16, device=run_device())
     op = SumFwdOp(dim=[-1, 0], keepdim=False)
-    ref = torch.sum(x.float(), dim=[0, 2], keepdim=False).to(torch.float16)
+    ref = reduction_reference("SumFwdOp", x, {"dim": [0, 2]})
     y = op(x)
     assert y.shape == ref.shape, f"shape mismatch: {y.shape} vs {ref.shape}"
     compare_outputs(y, ref, reduction_verification(ref.dtype))
@@ -227,22 +228,11 @@ def test_edge_axis_reduce_returns_the_storage_dtype(dtype: torch.dtype) -> None:
     """
 
     x = torch.randn(17, 32, 512, dtype=dtype, device=run_device())
-    for op_cls, ref in (
-        (SumFwdOp, lambda z: torch.sum(z.float(), dim=[0, 2])),
-        (MeanFwdOp, lambda z: torch.mean(z.float(), dim=[0, 2])),
-        (AmaxFwdOp, lambda z: torch.amax(z.float(), dim=[0, 2])),
-    ):
+    for op_cls in (SumFwdOp, MeanFwdOp, AmaxFwdOp, CountNonzeroFwdOp):
         out = op_cls(dim=[0, 2])(x)
-        assert out.dtype == dtype, f"{op_cls.__name__} returned {out.dtype}"
-        compare_outputs(out, ref(x).to(dtype), reduction_verification(dtype))
-
-    counted = CountNonzeroFwdOp(dim=[0, 2])(x)
-    assert counted.dtype == torch.int64
-    compare_outputs(
-        counted,
-        torch.count_nonzero(x, dim=[0, 2]),
-        reduction_verification(torch.int64),
-    )
+        ref = reduction_reference(op_cls.__name__, x, {"dim": [0, 2]})
+        assert out.dtype == ref.dtype, f"{op_cls.__name__} returned {out.dtype}"
+        compare_outputs(out, ref, reduction_verification(ref.dtype))
 
 
 @pytest.mark.smoke
@@ -255,7 +245,8 @@ def test_leading_axis_split_reduces_every_row(shape):
     """
 
     x = torch.randn(shape, dtype=torch.float16, device=run_device())
-    compare_outputs(SumFwdOp(dim=0)(x), x.sum(dim=0), reduction_verification(x.dtype))
+    ref = reduction_reference("SumFwdOp", x, {"dim": 0})
+    compare_outputs(SumFwdOp(dim=0)(x), ref, reduction_verification(x.dtype))
 
 
 @pytest.mark.smoke
@@ -312,29 +303,19 @@ def test_leading_axis_cluster_reduces_every_row_and_column(shape, dtype) -> None
     rows = torch.rand(shape[0] + 1, *shape[1:], dtype=dtype, device=run_device()) * 0.04 + 0.98
     rows[-1] = 100.0
     x = rows[:-1]
-    for op, ref in (
-        (SumFwdOp(dim=0), torch.sum(x.float(), dim=0)),
-        (MeanFwdOp(dim=0), torch.mean(x.float(), dim=0)),
-        (AmaxFwdOp(dim=0), torch.amax(x.float(), dim=0)),
-        (AminFwdOp(dim=0), torch.amin(x.float(), dim=0)),
-    ):
-        compare_outputs(op(x), ref.to(dtype), reduction_verification(dtype))
-    compare_outputs(
-        ProdFwdOp(dim=0)(x),
-        torch.prod(x.float(), dim=0).to(dtype),
-        reduction_verification(dtype, product=True),
-    )
+    for op_cls in (SumFwdOp, MeanFwdOp, AmaxFwdOp, AminFwdOp, ProdFwdOp):
+        ref = reduction_reference(op_cls.__name__, x, {"dim": 0})
+        evidence = reduction_verification(dtype, product=op_cls is ProdFwdOp)
+        compare_outputs(op_cls(dim=0)(x), ref, evidence)
 
 
 @pytest.mark.smoke
 def test_leading_axis_view_off_the_vector_boundary_reduces() -> None:
     """A view that starts between 16-byte vectors, which the cluster pass reads whole,
     reduces to the same sums."""
-    flat = torch.randn(2048 * 4096 + 1, dtype=torch.bfloat16, device=run_device())
-    x = flat[1:].view(2048, 4096)
-    compare_outputs(
-        SumFwdOp(dim=0)(x), x.float().sum(dim=0).bfloat16(), reduction_verification(x.dtype)
-    )
+    x = misaligned(torch.randn(2048, 4096, dtype=torch.bfloat16, device=run_device()))
+    ref = reduction_reference("SumFwdOp", x, {"dim": 0})
+    compare_outputs(SumFwdOp(dim=0)(x), ref, reduction_verification(x.dtype))
 
 
 @pytest.mark.smoke
@@ -342,14 +323,15 @@ def test_edge_columns_pass_in_one_cluster_launch() -> None:
     """The edge kernels' columns pass over enough fp32 partials takes the one launch, with
     and without a square-root epilogue."""
     x = torch.randn(40, 4096, 160, dtype=torch.float16, device=run_device())
+    params = {"dim": [0, 2], "ord": 2}
     compare_outputs(
         SumFwdOp(dim=[0, 2])(x),
-        torch.sum(x.float(), dim=[0, 2]).to(x.dtype),
+        reduction_reference("SumFwdOp", x, params),
         reduction_verification(x.dtype),
     )
     compare_outputs(
         VectorNormFwdOp(ord=2, dim=[0, 2])(x),
-        torch.linalg.vector_norm(x.float(), 2, (0, 2)).to(x.dtype),
+        reduction_reference("VectorNormFwdOp", x, params),
         vector_norm_verification(x.dtype),
     )
 
@@ -370,12 +352,9 @@ def test_leading_axis_vector_tiles_reduce_every_column(dtype: torch.dtype) -> No
 
     kept = _vector_tiles_kept(dtype)
     x = torch.rand(4, 2, kept // 2, dtype=dtype, device=run_device()) * 0.5 + 0.75
-    for op, ref in (
-        (ProdFwdOp(dim=0), torch.prod(x.float(), dim=0)),
-        (MeanFwdOp(dim=0), torch.mean(x.float(), dim=0)),
-        (AmaxFwdOp(dim=0), torch.amax(x.float(), dim=0)),
-    ):
-        compare_outputs(op(x), ref.to(dtype), reduction_verification(dtype))
+    for op_cls in (ProdFwdOp, MeanFwdOp, AmaxFwdOp):
+        ref = reduction_reference(op_cls.__name__, x, {"dim": 0})
+        compare_outputs(op_cls(dim=0)(x), ref, reduction_verification(dtype))
 
 
 @pytest.mark.smoke
@@ -443,22 +422,20 @@ def test_edge_axes_route_by_the_row_a_block_holds_in_flight(lead: int, folds: bo
 
     dtype = torch.float16
     x = torch.randn(lead, 8, 1000, dtype=dtype, device=run_device())
-    for op, ref, verification in (
-        (SumFwdOp(dim=[0, 2]), torch.sum(x.float(), dim=[0, 2]), reduction_verification),
-        (MeanFwdOp(dim=[0, 2]), torch.mean(x.float(), dim=[0, 2]), reduction_verification),
-        (AmaxFwdOp(dim=[0, 2]), torch.amax(x.float(), dim=[0, 2]), reduction_verification),
-        (AminFwdOp(dim=[0, 2]), torch.amin(x.float(), dim=[0, 2]), reduction_verification),
-        (
-            VectorNormFwdOp(ord=2, dim=[0, 2]),
-            torch.linalg.vector_norm(x.float(), 2, (0, 2)),
-            vector_norm_verification,
-        ),
+    for op in (
+        SumFwdOp(dim=[0, 2]),
+        MeanFwdOp(dim=[0, 2]),
+        AmaxFwdOp(dim=[0, 2]),
+        AminFwdOp(dim=[0, 2]),
+        VectorNormFwdOp(ord=2, dim=[0, 2]),
     ):
         out = op(x)
         (entry,) = op._entries_built("reduce").values()
         name = type(entry).__name__
         assert (name == "ReduceFoldKernel") == folds, f"{type(op).__name__} took {name}"
-        compare_outputs(out, ref.to(dtype), verification(dtype))
+        ref = reduction_reference(type(op).__name__, x, {"dim": [0, 2], "ord": 2})
+        verification = vector_norm_verification if isinstance(op, VectorNormFwdOp) else None
+        compare_outputs(out, ref, (verification or reduction_verification)(dtype))
 
 
 # Logical reduce ops: all, any, count_nonzero

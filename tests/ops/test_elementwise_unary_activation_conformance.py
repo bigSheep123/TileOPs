@@ -4,9 +4,8 @@ validation and registered-implementation dispatch."""
 import pytest
 import torch
 
+from tests.workload_test_base import op_preferring
 from tileops.backend import BUILTIN
-from tileops.backend import _registry as registry
-from tileops.backend._registry import register_kernel_type
 from workloads.device import run_device, run_device_available
 from workloads.elementwise import ElementwiseWorkload
 from workloads.numerics import compare_outputs
@@ -63,12 +62,7 @@ def test_clamp_family_registered_implementation_is_dispatched(form: str) -> None
         general = False
         preferred_over = frozenset({key})
 
-    state = registry.snapshot()
-    try:
-        register_kernel_type("ClampFwdOp", f"{key}_marker", MarkerKernel)
-        inst = mod.ClampFwdOp(target=BUILTIN)
-    finally:
-        registry.restore(state)
+    inst = op_preferring(mod.ClampFwdOp, f"{key}_marker", MarkerKernel, target=BUILTIN)
     x = torch.randn(2, 4, device=run_device(), dtype=torch.float16)
     inst(x, *bounds(x))
     ((built,),) = [tuple(inst._entries_built(interface).values())]

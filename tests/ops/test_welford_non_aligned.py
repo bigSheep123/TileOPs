@@ -8,7 +8,7 @@ from tests.workload_test_base import TestBase
 from tileops._ops.reduction.reduce import StdFwdOp, VarFwdOp, VarMeanFwdOp
 from workloads.device import run_device
 from workloads.numerics import compare_outputs
-from workloads.reduction import WelfordNonAlignedCase, _reduction_reference, reduction_verification
+from workloads.reduction import WelfordNonAlignedCase, reduction_reference, reduction_verification
 
 _OPS = {"var": VarFwdOp, "std": StdFwdOp, "var_mean": VarMeanFwdOp}
 
@@ -60,7 +60,7 @@ def test_welford_non_aligned_axes(
 ) -> None:
     x = torch.randn(*shape, dtype=dtype, device=run_device())
     out = _OPS[op_kind](dim=dim, keepdim=keepdim)(x)
-    ref = _reduction_reference(
+    ref = reduction_reference(
         _OPS[op_kind].__name__, x, dict(dim=dim, keepdim=keepdim, correction=1)
     )
     pairs = zip(out, ref, strict=True) if isinstance(ref, tuple) else [(out, ref)]

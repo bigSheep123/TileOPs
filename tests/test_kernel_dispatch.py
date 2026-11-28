@@ -110,7 +110,7 @@ def _selected(op: Op, *ns: int) -> dict:
 
 
 @pytest.fixture(autouse=True)
-def isolated_registry():
+def restored_registry():
     """Registrations made by a test do not outlive it."""
     state = registry.snapshot()
     yield

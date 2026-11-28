@@ -2,11 +2,11 @@ import pytest
 import torch
 
 from tests.cuda_graph_contract import check_replay
+from tests.misaligned import misaligned
 from tests.workload_test_base import FixtureBase, TestBase
 from tileops._kernels.transform import HadamardTransformCall
 from tileops.transform import HadamardTransformFwdOp
 from workloads.device import run_device
-from workloads.numerics import compare_outputs
 from workloads.transform import HadamardTransformWorkload
 
 
@@ -71,13 +71,9 @@ def test_hadamard_transform(
 def test_hadamard_transform_unaligned_storage(n: int, base_order: int) -> None:
     """An input whose storage starts off a 16-byte boundary reads the same rows."""
     rows = 6
-    flat = torch.randn(rows * n + 1, device=run_device(), dtype=torch.bfloat16)
-    x = flat[1:].view(rows, n)
-
-    got = HadamardTransformFwdOp(base_order)(x)
-
+    x = misaligned(torch.randn(rows, n, device=run_device(), dtype=torch.bfloat16))
     workload = HadamardTransformWorkload((rows,), n, x.dtype, base_order)
-    compare_outputs(got, workload.ref_program(x), workload.verification(x))
+    TestBase.check(workload, HadamardTransformFwdOp(base_order), x)
 
 
 @pytest.mark.sm90

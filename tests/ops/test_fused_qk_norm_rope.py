@@ -6,6 +6,7 @@ import torch
 
 from tests.compile_contract import assert_op_owns_graph_nodes, register_compile_contract
 from tests.cuda_graph_contract import check_replay
+from tests.misaligned import misaligned
 from tests.workload_test_base import TestBase
 from tileops.backend import OpNotAvailableError
 from tileops.manifest.primitives import stacked_positions
@@ -298,21 +299,13 @@ def test_fused_qk_norm_rope_eps() -> None:
     test.check(op, qkv, *rest, runs=lambda *args: fused_qk_norm_rope_result(op, *args))
 
 
-def _off_boundary(t):
-    """A copy of *t* whose storage starts one element past a 16-byte boundary."""
-    flat = torch.empty(t.numel() + 1, device=t.device, dtype=t.dtype)
-    shifted = flat[1:].view_as(t)
-    shifted.copy_(t)
-    return shifted
-
-
 @pytest.mark.smoke
 def test_fused_qk_norm_rope_unaligned_inputs() -> None:
     """Inputs whose storage starts off a 16-byte boundary give the same result, qkv in place."""
     test = FusedQKNormRoPETest(_packed(5), 4, 2, 128, 128, 8, torch.bfloat16, torch.bfloat16)
     inputs = test.gen_inputs()
     expected = test.ref_program(*inputs)
-    qkv, q_weight, k_weight, cache = (_off_boundary(t) for t in inputs[:4])
+    qkv, q_weight, k_weight, cache = (misaligned(t) for t in inputs[:4])
 
     assert FusedQKNormRoPEFwdOp(4, 2)(qkv, q_weight, k_weight, cache, inputs[4]) is None
 

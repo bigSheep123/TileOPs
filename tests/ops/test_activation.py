@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from tests.cuda_graph_contract import check_replay
 from tests.launch_bounds import elementwise_launch_bounds, full_occupancy_bounds
+from tests.misaligned import misaligned
 from tests.workload_test_base import FixtureBase, TestBase
 from tileops._kernels.elementwise import UnaryKernel
 from tileops._ops.elementwise import (
@@ -259,9 +260,7 @@ def test_sigmoid_input_off_a_vector_boundary() -> None:
     """A contiguous input starting one element past a 16-byte boundary matches the reference."""
     test = UnaryActivationTest(4096, torch.float32, "SigmoidFwdOp", gen_fn=_randn)
     (aligned,) = test.gen_inputs()
-    x = torch.empty(aligned.numel() + 1, device=run_device(), dtype=aligned.dtype)[1:]
-    x.copy_(aligned)
-    test.check(SigmoidFwdOp(), x)
+    test.check(SigmoidFwdOp(), misaligned(aligned))
 
 
 @pytest.mark.smoke

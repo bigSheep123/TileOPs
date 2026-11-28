@@ -21,23 +21,10 @@ from tileops.backend import (
 )
 from tileops.backend import _registry as registry
 
-pytestmark = pytest.mark.smoke
+pytestmark = [pytest.mark.smoke, pytest.mark.usefixtures("isolated_registry")]
 
 DTYPE = torch.float16
 NORMALIZED_SHAPE = (256,)
-
-
-@pytest.fixture(autouse=True)
-def isolated_registry():
-    """Each test starts with an empty registry and no backend discovery."""
-    state = registry.snapshot()
-    registry.DETECTORS.clear()
-    registry.BUILDERS.clear()
-    registry.LOAD_FAILURES.clear()
-    registry.default_target = None
-    registry._loaded = True
-    yield
-    registry.restore(state)
 
 
 class _Recorder:

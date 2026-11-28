@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import torch
 
+from workloads.attention.gqa.bwd import attention_grad_verification
 from workloads.attention.gqa.call_metadata import _dtype, _segments
 from workloads.device import run_device
 from workloads.numerics import (
@@ -9,7 +10,6 @@ from workloads.numerics import (
     Exact,
     assert_close,
     assert_normalized_error,
-    reference_tolerance,
     zeroed_input,
 )
 from workloads.sequence_metadata import make_cu_seqlens
@@ -433,14 +433,7 @@ class MLADenseBwdWorkload(WorkloadBase):
         return tuple(g.reshape(t.shape).to(q.dtype) for g, t in zip(grads, (q, k, v), strict=True))
 
     def verification(self, *inputs):
-        # The dtype rtol covers one stored step of a large gradient, the 5e-3 floor the
-        # float32 accumulation error near zero.
-        tolerance = reference_tolerance(inputs[0].dtype)
-        return Exact(
-            controls=(zeroed_input(0, "first-input-zeroed"),),
-            atol=max(5e-3, tolerance["atol"]),
-            rtol=tolerance["rtol"],
-        )
+        return attention_grad_verification(inputs[0].dtype)
 
 
 class MLADenseBwdCall(CallWorkload, MLADenseBwdWorkload):

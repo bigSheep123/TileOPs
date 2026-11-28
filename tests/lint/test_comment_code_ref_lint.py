@@ -1,17 +1,17 @@
 """Unit tests for ``scripts/lint/comment_code_ref_lint.py``."""
 
+import functools
 from pathlib import Path
 
 import comment_code_ref_lint as lint
 import pytest
 
+from tests.lint.lint_probe import probe_findings
+
 pytestmark = pytest.mark.smoke
 
 
-def _findings(tmp_path: Path, source: str) -> list[str]:
-    path = tmp_path / "probe.py"
-    path.write_text(source, encoding="utf-8")
-    return lint.findings(path)
+_findings = functools.partial(probe_findings, lint)
 
 
 FLAGGED = [

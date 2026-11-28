@@ -2,13 +2,11 @@ import pytest
 import torch
 
 from tests.cuda_graph_contract import CapturedGraph
-from tests.workload_test_base import FixtureBase, TestBase
+from tests.workload_test_base import FixtureBase, TestBase, op_preferring
 from tileops._kernels.attention import DSADecodeBasicKernel, DSADecodeKernel, DSADecodeWSKernel
 from tileops._utils import get_sm_version
 from tileops.attention import DSADenseFwdOp
 from tileops.backend import OpNotAvailableError
-from tileops.backend import _registry as registry
-from tileops.backend._registry import register_kernel_type
 from workloads.attention.dsa import DSADecodeWorkload
 from workloads.device import run_device
 
@@ -277,12 +275,9 @@ def test_dsa_decode_row_normalization(kernel, row) -> None:
     seq_len, seq_len_kv, q_start = 8, 512, 512
     # The one valid score of each row is 576 * 4096 * -4096, about -9.7e9.
     sm_scale = 1e-10 if row == "very-negative-score" else None
-    state = registry.snapshot()
-    try:
-        register_kernel_type("DSADenseFwdOp", "dsa_decode_pinned", Pinned)
-        op = DSADenseFwdOp(64, 1, q_start, sm_scale=sm_scale)
-    finally:
-        registry.restore(state)
+    op = op_preferring(
+        DSADenseFwdOp, "dsa_decode_pinned", Pinned, 64, 1, q_start, sm_scale=sm_scale
+    )
     test = DSADecodeTest(1, 64, seq_len, seq_len_kv, 512, 64, 128, 1, 1, q_start, sm_scale=sm_scale)
     q, kv, indices = test.gen_inputs()
     if row == "no-valid-index":

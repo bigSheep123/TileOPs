@@ -6,7 +6,8 @@ import torch
 import torch.nn.functional as F
 
 from tests.compile_contract import assert_op_owns_graph_nodes, register_compile_contract
-from tests.workload_test_base import FixtureBase, TestBase
+from tests.misaligned import misaligned
+from tests.workload_test_base import FixtureBase, TestBase, op_preferring
 from tileops._kernels.constants import SM_RESIDENT_BLOCKS
 from tileops._kernels.kernel_base import Kernel
 from tileops._kernels.pool import (
@@ -22,8 +23,6 @@ from tileops._kernels.pool import (
 from tileops._kernels.pool.call_spec import AvgPoolCall, MaxPoolCall
 from tileops._utils import device_facts
 from tileops.backend import BUILTIN
-from tileops.backend import _registry as registry
-from tileops.backend._registry import register_kernel_type
 from tileops.pool import (
     AdaptiveAvgPool2dFwdOp,
     AdaptiveMaxPool2dFwdOp,
@@ -2132,11 +2131,7 @@ def test_avg_pool2d_windows_read_into_registers(
 def test_pool_serves_an_input_off_a_vector_boundary(make_op, shape) -> None:
     """A contiguous input starting one element into its storage, which 16-byte loads
     cannot read in place, gives the result an aligned copy of it gives."""
-    numel = 1
-    for extent in shape:
-        numel *= extent
-    storage = torch.randn(1 + numel, device=run_device(), dtype=torch.float16)
-    x = storage[1:].view(shape)
+    x = misaligned(torch.randn(shape, device=run_device(), dtype=torch.float16))
     op = make_op()
     torch.testing.assert_close(op(x), op(x.clone()), rtol=0, atol=0)
 
@@ -2159,12 +2154,13 @@ def test_avg_pool_runs_a_registered_implementation_preferred_over_the_general_on
     class _PreferredPassthrough(_PassthroughGenericKernel):
         preferred_over = frozenset({"avg_pool2d_kernel"})
 
-    state = registry.snapshot()
-    try:
-        register_kernel_type("AvgPool2dFwdOp", "avg_pool2d_passthrough", _PreferredPassthrough)
-        op = AvgPool2dFwdOp(kernel_size=2, target=BUILTIN)
-    finally:
-        registry.restore(state)
+    op = op_preferring(
+        AvgPool2dFwdOp,
+        "avg_pool2d_passthrough",
+        _PreferredPassthrough,
+        kernel_size=2,
+        target=BUILTIN,
+    )
 
     # A width no 16-byte load divides, so no implementation preferred over the key serves it.
     op(torch.randn(1, 2, 8, 10, device=run_device(), dtype=torch.float16))
@@ -2501,11 +2497,9 @@ def test_adaptive_avg_pool2d_misaligned_view() -> None:
     """A contiguous view two bytes past a 16-byte boundary pools like an aligned tensor: the
     lane kernel's 16-byte loads of this global window read an aligned copy."""
     test = AdaptiveAvgPool2dTest(2, 64, 56, 56, (1, 1), torch.float16)
-    buf = torch.randn(1 + 2 * 64 * 56 * 56, device=run_device(), dtype=torch.float16)
-    x = buf[1:].view(2, 64, 56, 56)
+    x = misaligned(torch.randn(2, 64, 56, 56, device=run_device(), dtype=torch.float16))
     assert x.data_ptr() % 16 != 0
-    out = AdaptiveAvgPool2dFwdOp(output_size=test.output_size)(x)
-    compare_outputs(out, test.ref_program(x), test.verification(x))
+    test.check(AdaptiveAvgPool2dFwdOp(output_size=test.output_size), x)
 
 
 @pytest.mark.parametrize(

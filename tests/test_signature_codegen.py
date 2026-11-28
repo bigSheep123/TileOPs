@@ -604,22 +604,17 @@ def test_an_entry_with_a_call_time_input_and_no_composition_has_a_compile_bounda
 
 
 @pytest.fixture
-def acme():
+def acme(isolated_registry):
     """Return ``serve(op_name, build)``, which has the target ``acme`` serve a probe op."""
     from tileops.backend import _registry as registry
 
-    state = registry.snapshot()
-    registry.DETECTORS.clear()
-    registry.BUILDERS.clear()
-    registry.default_target, registry._loaded = None, True
     registry.register_detector("acme", lambda device: True)
 
     def serve(op_name, build):
         # A probe op has no manifest entry, which `register_kernel_builder` requires.
         registry.BUILDERS[(op_name, "acme")] = build
 
-    yield serve
-    registry.restore(state)
+    return serve
 
 
 def test_a_target_served_call_leaves_constructor_attributes_alone(acme):

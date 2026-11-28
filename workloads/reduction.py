@@ -24,7 +24,7 @@ class _ReductionCase(WorkloadBase):
         return (torch.randn(*self.shape, dtype=self.dtype, device=run_device()),)
 
     def ref_program(self, x: torch.Tensor):
-        return _reduction_reference(self._name, x, self._params)
+        return reduction_reference(self._name, x, self._params)
 
 
 class _ReductionWorkload(_ReductionCase):
@@ -53,7 +53,7 @@ class ProdWorkload(WorkloadBase):
         return (_near_one(self.shape, self.dtype, run_device()),)
 
     def ref_program(self, x: torch.Tensor) -> torch.Tensor:
-        return _reduction_reference("ProdFwdOp", x, dict(dim=-1))
+        return reduction_reference("ProdFwdOp", x, dict(dim=-1))
 
     def verification(self, *inputs):
         return reduction_verification(inputs[0].dtype, product=True, scalar=inputs[0].ndim == 0)
@@ -68,10 +68,10 @@ class ReductionCall(CallWorkload):
         self.shape, self.dtype = spec.shape, spec.dtype
 
     def ref_program(self, *inputs):
-        return _reduction_reference(self.call.signature.name, inputs[0], self.call.params)
+        return reduction_reference(self.call.signature.name, inputs[0], self.call.params)
 
     def torch_program(self, *inputs):
-        return _reduction_reference(
+        return reduction_reference(
             self.call.signature.name, inputs[0], self.call.params, native=True
         )
 
@@ -393,7 +393,7 @@ def softmax_verification(dtype, *, input_dtype=None, logarithmic=False):
     return Exact(**reference_tolerance(dtype))
 
 
-def _reduction_reference(name, x, p, native=False):
+def reduction_reference(name, x, p, native=False):
     """One reduction oracle; adapters supply parameters, never another formula.
 
     ``native`` runs the same torch call on ``x`` at its own dtype, passing a ``dtype``

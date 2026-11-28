@@ -104,14 +104,21 @@ class GQABwdWorkload(WorkloadBase):
             return tuple(grad.to(dtype) for grad in gradients)
 
     def verification(self, *inputs):
-        # Gradients reach |g| ~ 8, where one stored step exceeds any fixed atol: the dtype
-        # rtol covers that step, the 5e-3 floor the FP32 accumulation error near zero.
-        tolerance = reference_tolerance(inputs[0].dtype)
-        return Exact(
-            controls=(zeroed_input(0, "first-input-zeroed"),),
-            atol=max(5e-3, tolerance["atol"]),
-            rtol=tolerance["rtol"],
-        )
+        return attention_grad_verification(inputs[0].dtype)
+
+
+def attention_grad_verification(dtype: torch.dtype) -> Exact:
+    """The bound on an attention backward's gradients of *dtype*.
+
+    Gradients reach |g| ~ 8, where one stored step exceeds any fixed atol: the dtype rtol
+    covers that step, the 5e-3 floor the FP32 accumulation error near zero.
+    """
+    tolerance = reference_tolerance(dtype)
+    return Exact(
+        controls=(zeroed_input(0, "first-input-zeroed"),),
+        atol=max(5e-3, tolerance["atol"]),
+        rtol=tolerance["rtol"],
+    )
 
 
 class GQABwdCall(CallWorkload, GQABwdWorkload):

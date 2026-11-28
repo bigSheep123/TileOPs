@@ -31,7 +31,6 @@ from workloads.elementwise import (
     LerpCase,
     PowPositiveWorkload,
 )
-from workloads.numerics import compare_outputs
 from workloads.workload_base import manifest_call
 
 
@@ -70,29 +69,11 @@ def test_add_broadcast(a_shape, b_shape, dtype: torch.dtype) -> None:
 
 # One op per broadcast grid configuration: unstaged (sub), staged with a guarded quotient
 # and no bias-row reuse (remainder), staged (maximum).
-# (op_name, op_cls, ref_fn, gen_a, gen_b)
+# (op_cls, gen)
 _ARITH_BROADCAST_OPS = [
-    (
-        "sub",
-        SubFwdOp,
-        lambda a, b: (a.float() - b.float()).to(a.dtype),
-        lambda s, d: torch.randn(*s, dtype=d, device=run_device()),
-        lambda s, d: torch.randn(*s, dtype=d, device=run_device()),
-    ),
-    (
-        "remainder",
-        RemainderFwdOp,
-        torch.remainder,
-        lambda s, d: torch.rand(*s, dtype=d, device=run_device()) + 0.1,
-        lambda s, d: torch.rand(*s, dtype=d, device=run_device()) + 0.1,
-    ),
-    (
-        "maximum",
-        MaximumFwdOp,
-        lambda a, b: torch.maximum(a.float(), b.float()).to(a.dtype),
-        lambda s, d: torch.randn(*s, dtype=d, device=run_device()),
-        lambda s, d: torch.randn(*s, dtype=d, device=run_device()),
-    ),
+    (SubFwdOp, lambda s, d: torch.randn(*s, dtype=d, device=run_device())),
+    (RemainderFwdOp, lambda s, d: torch.rand(*s, dtype=d, device=run_device()) + 0.1),
+    (MaximumFwdOp, lambda s, d: torch.randn(*s, dtype=d, device=run_device())),
 ]
 
 
@@ -109,19 +90,16 @@ class ArithBroadcastFixture(FixtureBase):
         ]
         return [
             (
-                "op_name, op_cls, ref_fn, gen_a, gen_b, a_shape, b_shape",
+                "op_cls, gen, a_shape, b_shape",
                 [
                     pytest.param(
-                        name,
                         cls,
-                        ref,
-                        ga,
-                        gb,
+                        gen,
                         a_s,
                         b_s,
                         marks=pytest.mark.smoke if i == 0 and j == 0 else pytest.mark.full,
                     )
-                    for j, (name, cls, ref, ga, gb) in enumerate(_ARITH_BROADCAST_OPS)
+                    for j, (cls, gen) in enumerate(_ARITH_BROADCAST_OPS)
                     for i, (a_s, b_s) in enumerate(patterns)
                 ],
             ),
@@ -129,23 +107,9 @@ class ArithBroadcastFixture(FixtureBase):
 
 
 @ArithBroadcastFixture
-def test_binary_arith_broadcast(
-    op_name,
-    op_cls,
-    ref_fn,
-    gen_a,
-    gen_b,
-    a_shape,
-    b_shape,
-) -> None:
-    dtype = torch.float16
-    a = gen_a(a_shape, dtype)
-    b = gen_b(b_shape, dtype)
-    op = op_cls()
-    ref = ref_fn(a, b)
-    with torch.no_grad():
-        out = op(a, b)
-    compare_outputs(out, ref, ElementwiseWorkload(type(op).__name__, (a, b)).verification(*(a, b)))
+def test_binary_arith_broadcast(op_cls, gen, a_shape, b_shape) -> None:
+    a, b = gen(a_shape, torch.float16), gen(b_shape, torch.float16)
+    TestBase.check(ElementwiseWorkload(op_cls.__name__, (a, b)), op_cls(), a, b)
 
 
 class BinarySameShapeTest(BinarySameShapeCase, TestBase):
@@ -267,14 +231,15 @@ def test_floor_ops_match_torch_on_special_values(a_shape, b_shape, dtype) -> Non
     else:
         b.view(-1)[: len(values)] = grid
     a, b = a.to(dtype), b.to(dtype)
-    cases = [
-        (FloorDivideFwdOp(), torch.floor_divide),
-        (DivFwdOp(rounding_mode="floor"), lambda x, y: torch.div(x, y, rounding_mode="floor")),
-        (RemainderFwdOp(), torch.remainder),
-    ]
-    for op, ref_fn in cases:
-        out, ref = op(a, b), ref_fn(a, b)
-        compare_outputs(out, ref, ElementwiseWorkload(type(op).__name__, ()).verification(a, b))
+    for op_cls, kwargs in (
+        (FloorDivideFwdOp, {}),
+        (DivFwdOp, {"rounding_mode": "floor"}),
+        (RemainderFwdOp, {}),
+    ):
+        workload = ElementwiseWorkload(op_cls.__name__, (a, b), **kwargs)
+        op = op_cls(**kwargs)
+        TestBase.check(workload, op, a, b)
+        out, ref = op(a, b), workload.ref_program(a, b)
         number = ~ref.isnan()
         assert torch.equal(torch.signbit(out[number]), torch.signbit(ref[number]))
 
@@ -517,10 +482,10 @@ def test_max_min_return_a_canonical_nan(op_cls) -> None:
 class MaxMinSpecialValuesFixture(FixtureBase):
     PARAMS = [
         (
-            "op_cls, torch_ref",
+            "op_cls",
             [
-                pytest.param(MaximumFwdOp, torch.maximum, id="maximum"),
-                pytest.param(MinimumFwdOp, torch.minimum, id="minimum"),
+                pytest.param(MaximumFwdOp, id="maximum"),
+                pytest.param(MinimumFwdOp, id="minimum"),
             ],
         ),
         (
@@ -535,19 +500,18 @@ class MaxMinSpecialValuesFixture(FixtureBase):
 
 
 @MaxMinSpecialValuesFixture
-def test_max_min_nan_and_signed_zero(op_cls, torch_ref, dtype: torch.dtype) -> None:
+def test_max_min_nan_and_signed_zero(op_cls, dtype: torch.dtype) -> None:
     """NaN in either or both operands gives NaN; maximum(+0, -0) is +0 and minimum(-0, +0)
     is -0 in every operand order."""
     nan = float("nan")
     a = torch.tensor([nan, 1.0, nan, 0.0, -0.0, 0.0, -0.0, 3.0], dtype=dtype, device=run_device())
     b = torch.tensor([1.0, nan, nan, -0.0, 0.0, 0.0, -0.0, 2.0], dtype=dtype, device=run_device())
+    workload = ElementwiseWorkload(op_cls.__name__, (a, b))
     op = op_cls()
-    ref = torch_ref(a, b)
-    with torch.no_grad():
-        out = op(a, b)
+    TestBase.check(workload, op, a, b)
+    out, ref = op(a, b), workload.ref_program(a, b)
     assert torch.equal(torch.isnan(out), torch.isnan(ref)), f"out={out}, ref={ref}"
     mask = ~torch.isnan(ref)
-    compare_outputs(out, ref, ElementwiseWorkload(type(op).__name__, ()).verification(a, b))
     assert torch.equal(torch.signbit(out[mask]), torch.signbit(ref[mask])), f"out={out}"
 
 
@@ -610,10 +574,10 @@ def test_binary_op_does_not_keep_its_inputs() -> None:
 class OptimizedMaxMinFixture(FixtureBase):
     PARAMS = [
         (
-            "op_cls, torch_ref",
+            "op_cls",
             [
-                pytest.param(MaximumFwdOp, torch.maximum, id="maximum"),
-                pytest.param(MinimumFwdOp, torch.minimum, id="minimum"),
+                pytest.param(MaximumFwdOp, id="maximum"),
+                pytest.param(MinimumFwdOp, id="minimum"),
             ],
         ),
         (
@@ -627,15 +591,10 @@ class OptimizedMaxMinFixture(FixtureBase):
 
 
 @OptimizedMaxMinFixture
-def test_max_min_optimized_large(op_cls, torch_ref, n_total: int, dtype: torch.dtype) -> None:
-    shape = (n_total,)
-    a = torch.randn(*shape, device=run_device(), dtype=dtype)
-    b = torch.randn(*shape, device=run_device(), dtype=dtype)
-    op = op_cls()
-    ref = torch_ref(a, b)
-    with torch.no_grad():
-        out = op(a, b)
-    compare_outputs(out, ref, ElementwiseWorkload(type(op).__name__, (a, b)).verification(*(a, b)))
+def test_max_min_optimized_large(op_cls, n_total: int, dtype: torch.dtype) -> None:
+    a = torch.randn(n_total, device=run_device(), dtype=dtype)
+    b = torch.randn(n_total, device=run_device(), dtype=dtype)
+    TestBase.check(ElementwiseWorkload(op_cls.__name__, (a, b)), op_cls(), a, b)
 
 
 @pytest.mark.parametrize(
@@ -643,21 +602,13 @@ def test_max_min_optimized_large(op_cls, torch_ref, n_total: int, dtype: torch.d
     [pytest.param(False, marks=pytest.mark.smoke), pytest.param(True, marks=pytest.mark.full)],
 )
 def test_binary_ops_under_tuning(tune: bool) -> None:
-    for op_cls, ref_fn in (
-        (AddFwdOp, torch.add),
-        (MaximumFwdOp, torch.maximum),
-        (MinimumFwdOp, torch.minimum),
-    ):
+    for op_cls in (AddFwdOp, MaximumFwdOp, MinimumFwdOp):
         a = torch.randn(4096, device=run_device(), dtype=torch.float16)
         b = torch.randn(4096, device=run_device(), dtype=torch.float16)
         op = op_cls()
         if tune:
             op.request_tune()
-        compare_outputs(
-            op(a, b),
-            ref_fn(a, b),
-            ElementwiseWorkload(op_cls.__name__, (a, b)).verification(a, b),
-        )
+        TestBase.check(ElementwiseWorkload(op_cls.__name__, (a, b)), op, a, b)
 
 
 # LerpFwdOp with a Tensor weight
@@ -675,12 +626,7 @@ def test_lerp_tensor_same_shape(dtype: torch.dtype) -> None:
     a = torch.randn(shape, device=run_device(), dtype=dtype)
     b = torch.randn(shape, device=run_device(), dtype=dtype)
     w = torch.rand(shape, device=run_device(), dtype=dtype)
-    op = LerpFwdOp()
-    out = op(a, b, w)
-    ref = torch.lerp(a, b, w)
-    compare_outputs(
-        out, ref, ElementwiseWorkload(type(op).__name__, (a, b, w)).verification(*(a, b, w))
-    )
+    TestBase.check(ElementwiseWorkload("LerpFwdOp", (a, b, w)), LerpFwdOp(), a, b, w)
 
 
 @pytest.mark.smoke
@@ -745,18 +691,8 @@ def test_div_rounding_mode_eager(rounding_mode: str, dtype: torch.dtype) -> None
     a = torch.randn(*shape, dtype=dtype, device=run_device()) * 5.0
     b = torch.randn(*shape, dtype=dtype, device=run_device()) * 2.0 + 1.0
     b = torch.where(b.abs() < 0.5, torch.full_like(b, 1.0), b)
-    op = DivFwdOp(rounding_mode=rounding_mode)
-    with torch.no_grad():
-        out = op(a, b)
-    # torch rounds the quotient to ``dtype`` before rounding it to a whole number.
-    ref = torch.div(a, b, rounding_mode=rounding_mode)
-    compare_outputs(
-        out,
-        ref,
-        ElementwiseWorkload(type(op).__name__, (a, b), rounding_mode=rounding_mode).verification(
-            *(a, b)
-        ),
-    )
+    workload = ElementwiseWorkload("DivFwdOp", (a, b), rounding_mode=rounding_mode)
+    TestBase.check(workload, DivFwdOp(rounding_mode=rounding_mode), a, b)
 
 
 @pytest.mark.smoke
@@ -776,12 +712,7 @@ _BINARY_INT_DTYPES = [
     torch.int64,
 ]
 # Add / Mul / Maximum / Minimum accept bool too; Sub, as torch.sub, does not.
-_FULL_UNION_OPS = [
-    (AddFwdOp, torch.add),
-    (MulFwdOp, torch.mul),
-    (MaximumFwdOp, torch.maximum),
-    (MinimumFwdOp, torch.minimum),
-]
+_FULL_UNION_OPS = [AddFwdOp, MulFwdOp, MaximumFwdOp, MinimumFwdOp]
 
 
 def _gen_int_pair(n: int, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
@@ -808,72 +739,41 @@ def test_binary_arith_integer_dtype_add(dtype: torch.dtype) -> None:
     """AddFwdOp matches torch.add on every manifest-declared int dtype."""
     n = 4_096
     a, b = _gen_int_pair(n, dtype)
-    op = AddFwdOp()
-    ref = torch.add(a, b)
-    with torch.no_grad():
-        out = op(a, b)
-    compare_outputs(out, ref, ElementwiseWorkload(type(op).__name__, (a, b)).verification(*(a, b)))
-
-
-_INT_OP_CASES = _FULL_UNION_OPS + [(SubFwdOp, torch.sub)]
+    TestBase.check(ElementwiseWorkload("AddFwdOp", (a, b)), AddFwdOp(), a, b)
 
 
 class BinaryArithOpIntFixture(FixtureBase):
     PARAMS = [
         (
-            "op_cls, ref_fn",
+            "op_cls",
             [
-                pytest.param(op_cls, ref_fn, marks=pytest.mark.smoke)
-                for op_cls, ref_fn in _INT_OP_CASES
+                pytest.param(op_cls, marks=pytest.mark.smoke)
+                for op_cls in [*_FULL_UNION_OPS, SubFwdOp]
             ],
         ),
     ]
 
 
 @BinaryArithOpIntFixture
-def test_binary_arith_op_int32(op_cls, ref_fn) -> None:
+def test_binary_arith_op_int32(op_cls) -> None:
     """Each arithmetic op matches its torch reference on int32 inputs."""
-    n = 4_096
-    a, b = _gen_int_pair(n, torch.int32)
-    op = op_cls()
-    ref = ref_fn(a, b)
-    with torch.no_grad():
-        out = op(a, b)
-    compare_outputs(out, ref, ElementwiseWorkload(type(op).__name__, (a, b)).verification(*(a, b)))
-
-
-# On bool, add and maximum are logical OR, mul and minimum logical AND.
-_FULL_UNION_BOOL_REFS = [
-    (AddFwdOp, torch.logical_or),
-    (MulFwdOp, torch.logical_and),
-    (MaximumFwdOp, torch.logical_or),
-    (MinimumFwdOp, torch.logical_and),
-]
+    a, b = _gen_int_pair(4_096, torch.int32)
+    TestBase.check(ElementwiseWorkload(op_cls.__name__, (a, b)), op_cls(), a, b)
 
 
 class BinaryArithBoolDtypeFixture(FixtureBase):
     PARAMS = [
-        (
-            "op_cls, ref_fn",
-            [
-                pytest.param(op_cls, ref_fn, marks=pytest.mark.smoke)
-                for op_cls, ref_fn in _FULL_UNION_BOOL_REFS
-            ],
-        ),
+        ("op_cls", [pytest.param(op_cls, marks=pytest.mark.smoke) for op_cls in _FULL_UNION_OPS]),
     ]
 
 
 @BinaryArithBoolDtypeFixture
-def test_binary_arith_bool_dtype(op_cls, ref_fn) -> None:
-    """Add/Mul/Maximum/Minimum match logical OR/AND on torch.bool inputs."""
+def test_binary_arith_bool_dtype(op_cls) -> None:
+    """On bool, add and maximum are logical OR, mul and minimum logical AND, as in torch."""
     n = 4_096
     a = torch.randint(0, 2, (n,), device=run_device()).to(torch.bool)
     b = torch.randint(0, 2, (n,), device=run_device()).to(torch.bool)
-    op = op_cls()
-    ref = ref_fn(a, b)
-    with torch.no_grad():
-        out = op(a, b)
-    compare_outputs(out, ref, ElementwiseWorkload(type(op).__name__, (a, b)).verification(*(a, b)))
+    TestBase.check(ElementwiseWorkload(op_cls.__name__, (a, b)), op_cls(), a, b)
 
 
 @pytest.mark.smoke
@@ -929,11 +829,7 @@ def test_add_bool_broadcast() -> None:
     b_shape = (1, 16)
     a = torch.randint(0, 2, a_shape, device=run_device()).to(torch.bool)
     b = torch.randint(0, 2, b_shape, device=run_device()).to(torch.bool)
-    op = AddFwdOp()
-    ref = torch.logical_or(a, b)
-    with torch.no_grad():
-        out = op(a, b)
-    compare_outputs(out, ref, ElementwiseWorkload(type(op).__name__, (a, b)).verification(*(a, b)))
+    TestBase.check(ElementwiseWorkload("AddFwdOp", (a, b)), AddFwdOp(), a, b)
 
 
 @pytest.mark.smoke

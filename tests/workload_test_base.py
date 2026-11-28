@@ -104,6 +104,19 @@ class TestBase(WorkloadBase):
         )
 
 
+def op_preferring(op_cls, name: str, kernel_cls, *args, **kwargs):
+    """*op_cls* built with *kernel_cls* registered as *name*; the registration does not outlive
+    the construction."""
+    from tileops.backend import _registry as registry
+
+    state = registry.snapshot()
+    try:
+        registry.register_kernel_type(op_cls.__name__, name, kernel_cls)
+        return op_cls(*args, **kwargs)
+    finally:
+        registry.restore(state)
+
+
 def smoke_first(cases: list) -> list:
     """*cases* with the smoke ones first, the order the tier check requires."""
     return sorted(cases, key=lambda case: case.marks[0].name != "smoke")

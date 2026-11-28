@@ -17,7 +17,6 @@ from workloads.elementwise import (
     ElementwiseWorkload,
     FullRangeCase,
 )
-from workloads.numerics import compare_outputs
 
 
 class BitwiseTest(BitwiseCase, TestBase):
@@ -28,15 +27,11 @@ class FullRangeTest(FullRangeCase, TestBase):
     pass
 
 
-_BITWISE_OPS = [
-    ("bitwise_and", BitwiseAndFwdOp, torch.bitwise_and),
-    ("bitwise_or", BitwiseOrFwdOp, torch.bitwise_or),
-    ("bitwise_xor", BitwiseXorFwdOp, torch.bitwise_xor),
-]
+_BITWISE_OPS = [BitwiseAndFwdOp, BitwiseOrFwdOp, BitwiseXorFwdOp]
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize("op_cls", [BitwiseAndFwdOp, BitwiseOrFwdOp, BitwiseXorFwdOp])
+@pytest.mark.parametrize("op_cls", _BITWISE_OPS)
 def test_bitwise_binary_op(op_cls) -> None:
     test = BitwiseTest(4_096, op_cls.__name__)
     test.check(op_cls(), *test.gen_inputs())
@@ -50,38 +45,25 @@ class BitwiseBroadcastFixture(FixtureBase):
     def get_params(cls):
         bias = [
             pytest.param(
-                name,
-                cls,
-                ref,
+                op_cls,
                 (2, 64, 128),
                 (1, 1, 128),
                 marks=pytest.mark.smoke if j == 0 else pytest.mark.full,
             )
-            for j, (name, cls, ref) in enumerate(_BITWISE_OPS)
+            for j, op_cls in enumerate(_BITWISE_OPS)
         ]
-        name, cls, ref = _BITWISE_OPS[0]
         others = [
-            pytest.param(name, cls, ref, a_s, b_s, marks=pytest.mark.full)
+            pytest.param(_BITWISE_OPS[0], a_s, b_s, marks=pytest.mark.full)
             for a_s, b_s in (((2, 64, 128), (2, 64, 1)), ((64, 128), (1, 1)))
         ]
-        return [("op_name, op_cls, ref_fn, a_shape, b_shape", bias + others)]
+        return [("op_cls, a_shape, b_shape", bias + others)]
 
 
 @BitwiseBroadcastFixture
-def test_bitwise_broadcast(
-    op_name,
-    op_cls,
-    ref_fn,
-    a_shape,
-    b_shape,
-) -> None:
+def test_bitwise_broadcast(op_cls, a_shape, b_shape) -> None:
     a = torch.randint(-1000, 1000, a_shape, dtype=torch.int32, device=run_device())
     b = torch.randint(-1000, 1000, b_shape, dtype=torch.int32, device=run_device())
-    op = op_cls()
-    ref = ref_fn(a, b)
-    with torch.no_grad():
-        out = op(a, b)
-    compare_outputs(out, ref, ElementwiseWorkload(type(op).__name__, (a, b)).verification(*(a, b)))
+    TestBase.check(ElementwiseWorkload(op_cls.__name__, (a, b)), op_cls(), a, b)
 
 
 class LongInt64BitwiseFixture(FixtureBase):
@@ -120,42 +102,26 @@ def test_bitwise_or_int64_under_tuning() -> None:
 class BoolBitwiseFixture(FixtureBase):
     PARAMS = [
         (
-            "op_name, op_cls, ref_fn, a_shape, b_shape",
+            "op_cls, a_shape, b_shape",
             [
                 pytest.param(
-                    name,
-                    cls,
-                    ref,
-                    a_s,
-                    b_s,
-                    marks=pytest.mark.smoke if a_s == b_s else pytest.mark.full,
+                    op_cls, a_s, b_s, marks=pytest.mark.smoke if a_s == b_s else pytest.mark.full
                 )
                 for a_s, b_s in [
                     ((2048, 4096), (2048, 4096)),
                     ((2, 512, 768), (1, 1, 768)),
                 ]
-                for name, cls, ref in _BITWISE_OPS
+                for op_cls in _BITWISE_OPS
             ],
         ),
     ]
 
 
 @BoolBitwiseFixture
-def test_bool_bitwise_fast_path(
-    op_name,
-    op_cls,
-    ref_fn,
-    a_shape,
-    b_shape,
-) -> None:
+def test_bool_bitwise_fast_path(op_cls, a_shape, b_shape) -> None:
     a = torch.randint(0, 2, a_shape, device=run_device()).bool()
     b = torch.randint(0, 2, b_shape, device=run_device()).bool()
-    op = op_cls()
-    ref = ref_fn(a, b)
-    with torch.no_grad():
-        out = op(a, b)
-    assert out.dtype == torch.bool
-    compare_outputs(out, ref, ElementwiseWorkload(type(op).__name__, (a, b)).verification(*(a, b)))
+    TestBase.check(ElementwiseWorkload(op_cls.__name__, (a, b)), op_cls(), a, b)
 
 
 class BitwiseFixture(FixtureBase):

@@ -209,12 +209,13 @@ def test_a_param_changed_after_construction_is_solved_again():
     assert op._infer_output_shapes((3,))["y"] == (5,)
 
 
+@pytest.mark.usefixtures("isolated_registry")
 def test_a_target_kernel_is_built_again_for_a_changed_param():
     """A changed or in-place edited param builds another target kernel; a return to earlier
     params runs the kernel built from them."""
     from tileops.backend import _registry as registry
 
-    state, built = registry.snapshot(), []
+    built = []
 
     def build(x, *, scale, factors):
         built.append(scale)
@@ -222,28 +223,22 @@ def test_a_target_kernel_is_built_again_for_a_changed_param():
         weight = factors[0]
         return lambda x: x * scale * weight
 
-    try:
-        registry.DETECTORS.clear()
-        registry.BUILDERS.clear()
-        registry.default_target, registry._loaded = None, True
-        registry.register_detector("acme", lambda device: True)
-        # A probe op has no manifest entry, which `register_kernel_builder` requires.
-        registry.BUILDERS[("ProbeTargetParamFwdOp", "acme")] = build
-        params = {"scale": {"type": "float"}, "factors": {"type": "list[float]"}}
-        cls = _probe(lambda self, x: x, name="ProbeTargetParamFwdOp", params=params)
-        setattr(cls, PARAM_NAMES_ATTRIBUTE, ("scale", "factors"))
-        op, x = cls(scale=2.0, factors=[1.0]), torch.ones(2)
-        op(x)
-        op.scale = 3.0
-        assert op(x).tolist() == [3.0, 3.0]
-        op.factors[0] = 5.0
-        assert op(x).tolist() == [15.0, 15.0] and built == [2.0, 3.0, 3.0]
-        op.factors = [1.0]
-        assert op(x).tolist() == [3.0, 3.0]
-        op.scale = 2.0
-        assert op(x).tolist() == [2.0, 2.0] and built == [2.0, 3.0, 3.0]
-    finally:
-        registry.restore(state)
+    registry.register_detector("acme", lambda device: True)
+    # A probe op has no manifest entry, which `register_kernel_builder` requires.
+    registry.BUILDERS[("ProbeTargetParamFwdOp", "acme")] = build
+    params = {"scale": {"type": "float"}, "factors": {"type": "list[float]"}}
+    cls = _probe(lambda self, x: x, name="ProbeTargetParamFwdOp", params=params)
+    setattr(cls, PARAM_NAMES_ATTRIBUTE, ("scale", "factors"))
+    op, x = cls(scale=2.0, factors=[1.0]), torch.ones(2)
+    op(x)
+    op.scale = 3.0
+    assert op(x).tolist() == [3.0, 3.0]
+    op.factors[0] = 5.0
+    assert op(x).tolist() == [15.0, 15.0] and built == [2.0, 3.0, 3.0]
+    op.factors = [1.0]
+    assert op(x).tolist() == [3.0, 3.0]
+    op.scale = 2.0
+    assert op(x).tolist() == [2.0, 2.0] and built == [2.0, 3.0, 3.0]
 
 
 class _Functioning(torch.overrides.TorchFunctionMode):

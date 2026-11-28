@@ -14,7 +14,7 @@ from tileops._ops.reduction import (
 from tileops.backend import BUILTIN
 from workloads.device import run_device
 from workloads.numerics import compare_outputs
-from workloads.reduction import LogicalReduceCase, reduction_verification
+from workloads.reduction import LogicalReduceCase, reduction_reference, reduction_verification
 
 
 class LogicalReduceBasicFixture(FixtureBase):
@@ -49,13 +49,7 @@ _OPS = {"any": AnyFwdOp, "all": AllFwdOp, "count_nonzero": CountNonzeroFwdOp}
 
 
 def _reference(op_kind: str, x: torch.Tensor, dim, keepdim: bool = False) -> torch.Tensor:
-    """PyTorch's answer for *op_kind* over *dim*; ``dim=None`` with *keepdim* keeps every axis."""
-    if op_kind == "count_nonzero":
-        return torch.count_nonzero(x, dim=dim)
-    fn = torch.any if op_kind == "any" else torch.all
-    if dim is None:
-        return fn(x).reshape([1] * x.ndim) if keepdim else fn(x)
-    return fn(x, dim=dim, keepdim=keepdim)
+    return reduction_reference(_OPS[op_kind].__name__, x, {"dim": dim, "keepdim": keepdim})
 
 
 def _mixed(shape: tuple, dtype: torch.dtype) -> torch.Tensor:
@@ -215,7 +209,7 @@ def test_count_nonzero_exact_past_fp32_integers() -> None:
     x[1, 7] = False
     compare_outputs(
         CountNonzeroFwdOp(dim=-1)(x),
-        torch.count_nonzero(x, dim=-1),
+        _reference("count_nonzero", x, -1),
         reduction_verification(torch.int64),
     )
 

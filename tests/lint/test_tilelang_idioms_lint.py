@@ -5,29 +5,25 @@ fixture string — never on the live repo. The accepted forms matter as much as 
 rejected ones: each rule has a neighbouring form it must leave alone.
 """
 
+import functools
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from tests.lint.lint_probe import LINT_DIR, run_lint_script
+
 pytestmark = pytest.mark.smoke
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-LINT_SCRIPT = REPO_ROOT / "scripts" / "lint" / "tilelang_idioms_lint.py"
+LINT_SCRIPT = LINT_DIR / "tilelang_idioms_lint.py"
 
 # Concatenated so this file stays clean under the hook it tests.
 FILE_NOQA = "# ruff" + ": noqa"
 
 
-def run_lint(tmp_path: Path, content: str) -> subprocess.CompletedProcess:
-    target = tmp_path / "fixture.py"
-    target.write_text(content)
-    return subprocess.run(
-        [sys.executable, str(LINT_SCRIPT), str(target)],
-        capture_output=True,
-        text=True,
-    )
+run_lint = functools.partial(run_lint_script, "tilelang_idioms_lint.py")
 
 
 @pytest.mark.parametrize(

@@ -3,7 +3,6 @@
 import pytest
 import torch
 
-from tests.ops.test_fused_moe import moe_inputs
 from tests.workload_test_base import TestBase
 from tileops._kernels.gemm.call_spec import GEMMCall
 from tileops._kernels.gemm.dense import GEMMTMAKernel
@@ -13,14 +12,19 @@ from tileops._ops.moe.fused_moe import FusedMoEFwdOp
 from tileops.backend import _registry as registry
 from tileops.backend._registry import register_kernel_type
 from workloads.device import run_device
-from workloads.moe import (
-    FusedMoESharedExpertWorkload,
-    SharedExpertMLPWorkload,
-    moe_verification,
-    ref_shared_expert,
-)
-from workloads.numerics import compare_outputs
+from workloads.moe import FusedMoESharedExpertWorkload, SharedExpertMLPWorkload
 from workloads.workload_base import manifest_call
+
+
+def _workload(T, E, K, H, F, S=None, **params) -> FusedMoESharedExpertWorkload:
+    """One bfloat16 ``FusedMoESharedExpertFwdOp`` call, with the shared expert's weights when
+    *S* is given; *params* are its other manifest parameters."""
+    if S is not None:
+        params.update(S=S, some=["shared_w_gate_up", "shared_w_down"])
+    call = manifest_call(
+        "FusedMoESharedExpertFwdOp", {"D": "bfloat16"}, T=T, E=E, H=H, F=F, top_k=K, **params
+    )
+    return FusedMoESharedExpertWorkload(call)
 
 
 @pytest.mark.smoke
@@ -147,55 +151,23 @@ def test_the_shared_expert_splits_k_at_32_tokens(hidden, ffn):
     [pytest.param(32, marks=pytest.mark.smoke), pytest.param(512, marks=pytest.mark.full)],
 )
 def test_fused_moe_shared_expert_basic(num_tokens):
-    """FusedMoESharedExpertFwdOp with shared expert kernel."""
-    torch.manual_seed(42)
-    T, E, K, H, F, F_s = num_tokens, 8, 2, 64, 32, 16
-    dtype = torch.bfloat16
-    dev = run_device()
+    """Both halves meet the reference, and the routed half is FusedMoE's output."""
+    K = 2
+    workload = _workload(num_tokens, 8, K, 64, 32, S=16)
+    inputs = workload.gen_inputs()
+    op = FusedMoESharedExpertFwdOp(**workload.arguments())
+    TestBase.check(workload, op, *inputs)
 
-    hidden, gating, w_gate_up, w_down = moe_inputs(T, E, H, F)
-    shared_w_gate_up = torch.randn(F_s * 2, H, dtype=dtype, device=dev) * 0.02
-    shared_w_down = torch.randn(H, F_s, dtype=dtype, device=dev) * 0.02
-
-    op = FusedMoESharedExpertFwdOp(
-        top_k=K,
-        scoring_func="softmax",
-        renormalize=False,
-    )
-
-    shared_out, routed_out = op(
-        hidden,
-        gating,
-        w_gate_up,
-        w_down,
-        shared_w_gate_up=shared_w_gate_up,
-        shared_w_down=shared_w_down,
-    )
-
-    assert shared_out.shape == (T, H)
-    assert routed_out.shape == (T, H)
-    assert shared_out.dtype == dtype
-    assert routed_out.dtype == dtype
-
-    shared_ref = ref_shared_expert(hidden, shared_w_gate_up, shared_w_down)
-    compare_outputs(shared_out, shared_ref, moe_verification(1))
-
-    # routed_out matches FusedMoE
-    op_routed = FusedMoEFwdOp(
-        top_k=K,
-        scoring_func="softmax",
-        renormalize=False,
-    )
-    routed_ref = op_routed(hidden, gating, w_gate_up, w_down)
-    assert torch.equal(routed_out, routed_ref)
+    _, routed_out = op(*inputs)
+    assert torch.equal(routed_out, FusedMoEFwdOp(top_k=K)(*inputs[:4]))
 
 
 @pytest.mark.smoke
 def test_fused_moe_shared_expert_none():
     """Without the shared weights, shared_out is None."""
-    torch.manual_seed(42)
     T, E, K, H, F = 16, 4, 2, 32, 16
-    shared_out, routed_out = FusedMoESharedExpertFwdOp(top_k=K)(*moe_inputs(T, E, H, F))
+    workload = _workload(T, E, K, H, F)
+    shared_out, routed_out = FusedMoESharedExpertFwdOp(top_k=K)(*workload.gen_inputs())
 
     assert shared_out is None
     assert routed_out.shape == (T, H)
@@ -215,8 +187,12 @@ def test_the_shared_expert_refuses_a_non_silu_activation():
     would disagree, so a call passing the shared weights is refused."""
     T, E, H, F, S = 4, 4, 128, 128, 128
     op = FusedMoESharedExpertFwdOp(2, activation="gelu_and_mul")
+    hidden, gating, w_gate_up, w_down, *_ = _workload(T, E, 2, H, F).gen_inputs()
     args = (
-        *moe_inputs(T, E, H, F),
+        hidden,
+        gating,
+        w_gate_up,
+        w_down,
         None,
         torch.randn(2 * S, H, dtype=torch.bfloat16, device=run_device()),
         torch.randn(H, S, dtype=torch.bfloat16, device=run_device()),
@@ -227,70 +203,17 @@ def test_the_shared_expert_refuses_a_non_silu_activation():
 
 @pytest.mark.smoke
 def test_fused_moe_shared_expert_tp():
-    """TP sharding: the float32 sum of the ranks' partial outputs matches the per-shard
-    reference."""
-    torch.manual_seed(42)
-    T, E, K, H, F, F_s = 32, 8, 2, 64, 32, 16
-    tp_size = 2
-    dtype = torch.bfloat16
-    dev = run_device()
+    """Each rank's shared output is its shard's partial sum, and the routed output does not
+    depend on the rank."""
+    K = 2
+    for tp_rank in range(2):
+        workload = _workload(32, 8, K, 64, 32, S=16, tp_size=2, tp_rank=tp_rank)
+        inputs = workload.gen_inputs()
+        op = FusedMoESharedExpertFwdOp(**workload.arguments())
+        TestBase.check(workload, op, *inputs)
 
-    hidden, gating, w_gate_up, w_down = moe_inputs(T, E, H, F)
-    shared_w_gate_up = torch.randn(F_s * 2, H, dtype=dtype, device=dev) * 0.02
-    shared_w_down = torch.randn(H, F_s, dtype=dtype, device=dev) * 0.02
-
-    # Each rank's contribution: column-parallel on gate_up, row-parallel on down.
-    shard_size = F_s // tp_size
-    partial_sum_ref = torch.zeros(T, H, dtype=torch.float32, device=dev)
-    for tp_rank in range(tp_size):
-        gate_up_shard = torch.cat(
-            [
-                shared_w_gate_up[tp_rank * shard_size : (tp_rank + 1) * shard_size],  # gate shard
-                shared_w_gate_up[
-                    F_s + tp_rank * shard_size : F_s + (tp_rank + 1) * shard_size
-                ],  # up shard
-            ],
-            dim=0,
-        )  # [2*shard, H]
-        down_shard = shared_w_down[
-            :, tp_rank * shard_size : (tp_rank + 1) * shard_size
-        ]  # [H, shard]
-        partial_sum_ref += ref_shared_expert(hidden.float(), gate_up_shard, down_shard)
-
-    # routed reference (not affected by TP)
-    op_routed = FusedMoEFwdOp(
-        top_k=K,
-        scoring_func="softmax",
-        renormalize=False,
-    )
-    routed_ref = op_routed(hidden, gating, w_gate_up, w_down)
-
-    # TP: accumulate partial outputs to simulate all-reduce
-    partial_sum = torch.zeros(T, H, dtype=torch.float32, device=dev)
-    for tp_rank in range(tp_size):
-        op_tp = FusedMoESharedExpertFwdOp(
-            top_k=K,
-            scoring_func="softmax",
-            renormalize=False,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-        )
-        shared_partial, routed_out = op_tp(
-            hidden,
-            gating,
-            w_gate_up,
-            w_down,
-            shared_w_gate_up=shared_w_gate_up,
-            shared_w_down=shared_w_down,
-        )
-        assert shared_partial.shape == (T, H)
-        partial_sum += shared_partial.float()
-
-        # routed_out is not affected by TP sharding of shared expert
-        assert torch.equal(routed_out, routed_ref)
-
-    # partial_sum vs per-shard float32 math reference (same computation path)
-    compare_outputs(partial_sum, partial_sum_ref, moe_verification(1))
+        _, routed_out = op(*inputs)
+        assert torch.equal(routed_out, FusedMoEFwdOp(top_k=K)(*inputs[:4]))
 
 
 @pytest.mark.smoke
@@ -309,7 +232,7 @@ def test_fused_moe_shared_expert_tp_rejects_local_shards():
         tp_rank=0,
     )
 
-    hidden, gating, w_gate_up, w_down = moe_inputs(T, E, H, F)
+    hidden, gating, w_gate_up, w_down, *_ = _workload(T, E, K, H, F).gen_inputs()
 
     shard_size = F_s // tp_size
 
@@ -361,13 +284,7 @@ def test_a_replaced_shared_expert_kernel_is_the_one_built():
     finally:
         registry.restore(state)
 
-    dtype, dev = torch.bfloat16, run_device()
-    torch.manual_seed(7)
-    op(
-        *moe_inputs(T, E, H, F),
-        shared_w_gate_up=torch.randn(F_s * 2, H, dtype=dtype, device=dev) * 0.02,
-        shared_w_down=torch.randn(H, F_s, dtype=dtype, device=dev) * 0.02,
-    )
+    op(*_workload(T, E, K, H, F, S=F_s).gen_inputs())
     assert built, "the replacement was never constructed"
 
 

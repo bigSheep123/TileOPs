@@ -9,7 +9,6 @@ import tileops._ops.elementwise as elementwise_mod
 from tests.workload_test_base import TestBase
 from workloads.device import run_device, run_device_available
 from workloads.elementwise import ElementwiseWorkload
-from workloads.numerics import compare_outputs
 
 
 def _randn(s, d):
@@ -91,12 +90,9 @@ def test_channel_broadcast_with_ragged_inner_dim(op_name: str) -> None:
 
     ``div`` is ordered, so a swapped operand would not cancel out.
     """
-    cls = getattr(elementwise_mod, op_name)
     a = torch.randn(2, 3, 10, 30, dtype=torch.float16, device=run_device())
     b = torch.rand(3, 1, 1, dtype=torch.float16, device=run_device()) + 0.5
-    ref = torch.maximum(a, b) if op_name == "MaximumFwdOp" else a / b
-    out = cls()(a, b)
-    compare_outputs(out, ref, ElementwiseWorkload(op_name, (a, b)).verification(a, b))
+    TestBase.check(ElementwiseWorkload(op_name, (a, b)), getattr(elementwise_mod, op_name)(), a, b)
 
 
 # Rows that are not a whole number of a thread's vectors, against a full operand; each
@@ -235,9 +231,7 @@ def test_staged_row_broadcast_matches_torch(a_shape, b_shape, dtype):
     """A staged predicate broadcast agrees with torch on every stride pair."""
     a = torch.randn(a_shape, device=run_device(), dtype=dtype)
     b = torch.randn(b_shape, device=run_device(), dtype=dtype)
-    out = elementwise_mod.GtFwdOp()(a, b)
-    assert out.dtype == torch.bool
-    compare_outputs(out, torch.gt(a, b), ElementwiseWorkload("GtFwdOp", (a, b)).verification(a, b))
+    TestBase.check(ElementwiseWorkload("GtFwdOp", (a, b)), elementwise_mod.GtFwdOp(), a, b)
 
 
 _TAIL_SHAPES = [

@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from tests.cuda_graph_contract import check_replay
+from tests.misaligned import misaligned
 from tests.workload_test_base import FixtureBase, TestBase
 from tileops._ops.elementwise import GELUAndMulFwdOp, SiLUAndMulFwdOp
 from workloads.device import run_device
@@ -89,9 +90,7 @@ def test_silu_and_mul_input_off_a_vector_boundary() -> None:
     """A contiguous input starting one element past a 16-byte boundary matches the reference."""
     test = SiLUAndMulTest(64, 1024, torch.bfloat16)
     (aligned,) = test.gen_inputs()
-    x = torch.empty(aligned.numel() + 1, device=run_device(), dtype=aligned.dtype)[1:]
-    x = x.view(aligned.shape).copy_(aligned)
-    test.check(SiLUAndMulFwdOp(), x)
+    test.check(SiLUAndMulFwdOp(), misaligned(aligned))
 
 
 class SiLUAndMulClampedFixture(FixtureBase):

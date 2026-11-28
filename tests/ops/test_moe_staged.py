@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from tests.cuda_graph_contract import check_replay
+from tests.misaligned import misaligned
 from tileops._kernels.kernel_base import Kernel
 from tileops._kernels.moe import (
     MGroupedGEMMCall,
@@ -1089,9 +1090,7 @@ def test_grouped_gemm_accepts_offset_storage(dtype, shift, masked, arch):
     if masked:
         inputs["layout_metadata"].copy_(torch.tensor([33, 0, 64], device=run_device()))
     if shift != "out":
-        value = inputs[shift]
-        storage = torch.empty(value.numel() + 1, dtype=dtype, device=value.device)
-        inputs[shift] = storage[1:].view_as(value).copy_(value)
+        inputs[shift] = misaligned(inputs[shift])
         assert inputs[shift].is_contiguous() and inputs[shift].data_ptr() % 16
     before = {name: value.clone() for name, value in inputs.items()}
     expected = workload.ref_program(*inputs.values())

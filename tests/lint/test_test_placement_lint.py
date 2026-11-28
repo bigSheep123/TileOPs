@@ -1,17 +1,17 @@
 """Unit tests for ``scripts/lint/test_placement_lint.py``."""
 
+import functools
 from pathlib import Path
 
 import pytest
 import test_placement_lint as lint
 
+from tests.lint.lint_probe import probe_findings
+
 pytestmark = pytest.mark.smoke
 
 
-def _findings(tmp_path: Path, source: str) -> list[str]:
-    path = tmp_path / "test_probe.py"
-    path.write_text(source, encoding="utf-8")
-    return lint.findings(path)
+_findings = functools.partial(probe_findings, lint, name="test_probe.py")
 
 
 def test_a_kernel_construction_is_reported_with_its_function(tmp_path: Path) -> None:

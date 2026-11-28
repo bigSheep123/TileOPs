@@ -17,6 +17,7 @@ from tests.ops.moe_grouped_gemm_helpers import (
     run_into_guarded_out,
     with_counts,
 )
+from tests.workload_test_base import op_preferring
 from tileops._kernels.moe import (
     MGroupedGEMMFP8Call,
     MoEGroupedGEMMFP8Kernel,
@@ -26,8 +27,6 @@ from tileops._kernels.moe.moe_grouped_gemm_fp8 import _smem_bytes
 from tileops._ops.moe import MaskedLayoutSpec, MoEGroupedGEMMFP8FwdOp
 from tileops._ops.moe.contracts import layout_call_fields
 from tileops.backend import BUILTIN
-from tileops.backend import _registry as registry
-from tileops.backend._registry import register_kernel_type
 from tileops.manifest import load_workloads
 from workloads.moe import MoEGroupedGEMMFP8Workload
 
@@ -105,12 +104,7 @@ def _forced_op(layout, config: dict, kernel=MoEGroupedGEMMFP8Kernel) -> MoEGroup
         def default_config(self) -> dict:
             return dict(config)
 
-    state = registry.snapshot()
-    try:
-        register_kernel_type(_OP, f"{_KEY}_forced", Forced)
-        return MoEGroupedGEMMFP8FwdOp(layout)
-    finally:
-        registry.restore(state)
+    return op_preferring(MoEGroupedGEMMFP8FwdOp, f"{_KEY}_forced", Forced, layout)
 
 
 @pytest.mark.sm90
