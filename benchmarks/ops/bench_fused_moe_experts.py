@@ -9,7 +9,7 @@ from benchmarks.moe_baselines import (
     flashinfer_experts_skip_reason,
     vllm_experts,
 )
-from tileops._ops.moe import (
+from tileops.moe import (
     ContiguousLayoutSpec,
     FusedMoEExpertsFwdOp,
     IndexedExpertMLPFwdOp,

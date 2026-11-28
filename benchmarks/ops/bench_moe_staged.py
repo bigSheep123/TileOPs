@@ -9,9 +9,10 @@ from benchmarks.baselines import (
     VLLM_TAG,
     compiled_reference,
     flashinfer_op,
+    flashinfer_workspace,
     vllm_op,
 )
-from tileops._ops.moe import (
+from tileops.moe import (
     MoEExpertMLPFwdOp,
     MoEGroupedGEMMFwdOp,
     MoEPostPermuteFwdOp,
@@ -74,9 +75,7 @@ def test_moe_post_permute_bench(case) -> None:
 
 
 def _flashinfer_segment_gemm(ends: torch.Tensor):
-    wrapper = flashinfer_op("gemm.SegmentGEMMWrapper")(
-        torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=ends.device)
-    )
+    wrapper = flashinfer_op("gemm.SegmentGEMMWrapper")(flashinfer_workspace(ends.device, mib=32))
     indptr = torch.cat((ends.new_zeros(1), ends)).to(torch.int64)
 
     def run(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:

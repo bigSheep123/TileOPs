@@ -19,25 +19,28 @@ from benchmarks.baselines import (
     vllm_op,
     vllm_state_lines,
 )
-from tileops._ops.mamba.causal_conv1d import CausalConv1dFwdOp, CausalConv1dUpdateFwdOp
-from tileops._ops.mamba.mamba2_fwd import Mamba2FwdOp
-from tileops._ops.mamba.selective_scan import SelectiveScanFwdOp
-from tileops._ops.mamba.ssd_chunk_coupling import SSDChunkCouplingFwdOp
-from tileops._ops.mamba.ssd_chunk_cumsum import SSDChunkCumsumFwdOp
-from tileops._ops.mamba.ssd_chunk_scan import SSDChunkScanFwdOp
-from tileops._ops.mamba.ssd_chunk_state import SSDChunkStateFwdOp
-from tileops._ops.mamba.ssd_recurrent import SSDRecurrentFwdOp
-from tileops._ops.mamba.ssd_state_passing import SSDStatePassingFwdOp
+from tileops.mamba import (
+    CausalConv1dFwdOp,
+    CausalConv1dUpdateFwdOp,
+    Mamba2FwdOp,
+    SelectiveScanFwdOp,
+    SSDChunkCouplingFwdOp,
+    SSDChunkCumsumFwdOp,
+    SSDChunkScanFwdOp,
+    SSDChunkStateFwdOp,
+    SSDRecurrentFwdOp,
+    SSDStatePassingFwdOp,
+)
 from workloads.mamba import ssd_decode_result
 
 VLLM_CONV1D = "model_executor.layers.mamba.ops.causal_conv1d"
 
-# vLLM's Mamba-2 kernels, which carry mamba_ssm's Triton SSD stages over packed varlen tokens.
-_VLLM_SSD = "vllm.model_executor.layers.mamba.ops."
-
 
 def _vllm_ssd(module: str, name: str):
-    return getattr(baseline_module(_VLLM_SSD + module, VLLM_TAG), name)
+    """vLLM's Mamba-2 kernels, which carry mamba_ssm's Triton SSD stages over packed varlen tokens."""
+    return getattr(
+        baseline_module(f"vllm.model_executor.layers.mamba.ops.{module}", VLLM_TAG), name
+    )
 
 
 def _vllm_chunks(batch: int, seqlen: int, chunk_size: int, device: torch.device):

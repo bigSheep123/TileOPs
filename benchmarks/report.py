@@ -49,13 +49,12 @@ def _get_env_metadata() -> list[str]:
     if uuid is None:
         return lines
 
-    # Try to get NVIDIA driver version and clocks from nvidia-smi.
+    # Not `clocks.applications.*`: deprecated, and the driver answers it with an error string.
     gpu_query_fields = [
         "driver_version",
-        "clocks.current.sm",
+        "clocks.current.graphics",
+        "clocks.max.graphics",
         "clocks.current.memory",
-        "clocks.applications.graphics",
-        "clocks.applications.memory",
     ]
     gpu_query_values = []
     try:
@@ -78,13 +77,11 @@ def _get_env_metadata() -> list[str]:
     if len(gpu_query_values) != len(gpu_query_fields):
         lines.append("- **Driver version**: N/A")
     else:
-        driver, sm_clock, mem_clock, app_sm_clock, app_mem_clock = gpu_query_values
+        driver, sm_clock, sm_clock_max, mem_clock = gpu_query_values
         lines.append(f"- **Driver version**: {driver}")
         lines.append(
-            "- **GPU clocks**: "
-            f"SM current {sm_clock} MHz, memory current {mem_clock} MHz, "
-            f"application SM {app_sm_clock} MHz, "
-            f"application memory {app_mem_clock} MHz"
+            f"- **GPU clocks**: SM current {sm_clock} MHz (max {sm_clock_max} MHz), "
+            f"memory current {mem_clock} MHz"
         )
 
     return lines

@@ -26,10 +26,12 @@ import statistics
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import torch
-from fma_throughput import _ClockSampler
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from benchmarks.hardware._common import ClockSampler
 from tileops._perf import load_profile
 
 
@@ -191,7 +193,7 @@ def _measure_dtype(dtype_name, operands, sizes, runs, device, gpu_index, theo_tf
     """
     best = (0.0, None, None)
     configs = []  # (n, flops, ms_per_launch, med, spread, settled)
-    sampler = _ClockSampler(gpu_index) if gpu_index is not None else None
+    sampler = ClockSampler(gpu_index) if gpu_index is not None else None
     if sampler:
         sampler.start()
     try:

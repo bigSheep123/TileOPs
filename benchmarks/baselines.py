@@ -17,6 +17,7 @@ import importlib.abc
 import importlib.util
 import sys
 from collections.abc import Callable
+from itertools import accumulate
 from typing import Any
 
 import pytest
@@ -89,11 +90,6 @@ def compiled_reference(
     return compiled_fn
 
 
-# Libraries whose kernels are CUDA's own: no other device runs them, installed or not.
-# The rest, Triton-based or with platform plugins, run wherever they are installed.
-_CUDA_ONLY = frozenset({"cudnn", "deepgemm", "deepspeed", "fa3", "flashinfer", "nvmath", "quack"})
-
-
 def _unavailable(module: str, library: str, package: "str | None" = None) -> "str | None":
     """Why *library* cannot run on the run device, or ``None`` when it can.
 
@@ -101,8 +97,11 @@ def _unavailable(module: str, library: str, package: "str | None" = None) -> "st
     is absent: its top-level package unless it lives under a namespace others share, as
     ``nvidia.cudnn`` does.
     """
+    # Libraries whose kernels are CUDA's own: no other device runs them, installed or not.
+    # The rest, Triton-based or with platform plugins, run wherever they are installed.
+    cuda_only = {"cudnn", "deepgemm", "deepspeed", "fa3", "flashinfer", "nvmath", "quack"}
     device = bench_device()
-    if library in _CUDA_ONLY and device.type != "cuda":
+    if library in cuda_only and device.type != "cuda":
         return f"{library} runs on cuda, not {device}"
     if not _installed(package or module.split(".")[0]):
         return f"{library} is not installed for {device}"
@@ -307,6 +306,26 @@ def deepspeed_op(name: str) -> Any:
 def flashinfer_op(name: str, module: str = "") -> Callable:
     """Return the ``flashinfer`` entry point *name*, dots allowed for submodules."""
     return _resolve(f"flashinfer.{module}" if module else "flashinfer", name, "flashinfer")
+
+
+def flashinfer_workspace(device: torch.device, mib: int = 128) -> torch.Tensor:
+    """The scratch buffer a FlashInfer wrapper is constructed with."""
+    return torch.empty(mib * 1024 * 1024, dtype=torch.uint8, device=device)
+
+
+def flashinfer_paged_kv(
+    page_table: torch.Tensor, seqlens: torch.Tensor, page_size: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """FlashInfer's paged-KV CSR over the pages each request reaches.
+
+    Returns ``(indptr, indices, last_page_len)``: int32 page offsets per request, the
+    concatenated page ids from ``page_table[b, :pages_b]``, and the fill of each last page.
+    """
+    seqlens = seqlens.int()
+    pages = ((seqlens + page_size - 1) // page_size).tolist()
+    indptr = torch.tensor([0, *accumulate(pages)], dtype=torch.int32, device=page_table.device)
+    indices = torch.cat([page_table[b, :n] for b, n in enumerate(pages)])
+    return indptr, indices, (seqlens - 1) % page_size + 1
 
 
 def fla_op(name: str) -> Callable:

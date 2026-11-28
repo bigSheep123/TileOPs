@@ -160,7 +160,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       is_fork: ${{ steps.policy.outputs.is_fork }}
-      allow_fast_path: ${{ steps.policy.outputs.allow_fast_path }}
       skip_gpu_smoke: ${{ steps.policy.outputs.skip_gpu_smoke }}
       scope: ${{ steps.policy.outputs.scope }}
       pytest_targets: ${{ steps.policy.outputs.pytest_targets }}
@@ -198,6 +197,27 @@ jobs:
               selected_targets+=("$target")
               seen_targets["$target"]=1
             fi
+          }
+
+          # Build, install and workflow files: a fork PR changing one runs GPU smoke.
+          is_high_risk() {
+            case "$1" in
+              .github/workflows/*|pyproject.toml|requirements*.txt|requirements*.in|setup.py|setup.cfg|Dockerfile*|scripts/bootstrap*|scripts/install*)
+                return 0
+                ;;
+            esac
+            return 1
+          }
+
+          write_outputs() {
+            {
+              echo "is_fork=$is_fork"
+              echo "skip_gpu_smoke=$skip_gpu_smoke"
+              echo "scope=$scope"
+              echo "pytest_targets=$pytest_targets"
+              echo "full_tier_targets=$full_tier_targets"
+              echo "reason=$reason"
+            } >> "$GITHUB_OUTPUT"
           }
 
           is_fork="false"
@@ -258,10 +278,8 @@ jobs:
             done
             full_tier_targets="${full_targets_list[*]}"
 
-            # Fast path: if no Python files changed, GPU smoke is unnecessary.
-            # For fork PRs, also check for high-risk files (workflow, build
-            # config, etc.) that must still trigger GPU smoke even without
-            # Python changes to avoid security bypass.
+            # Fast path: a change with no Python, manifest or native source skips
+            # GPU smoke, unless a fork PR changes a high-risk file.
             has_python="false"
             has_contract="false"
             has_native="false"
@@ -283,46 +301,25 @@ jobs:
                   has_native="true"
                   ;;
               esac
-              if [[ "$is_fork" == "true" ]]; then
-                case "$path" in
-                  .github/workflows/*|pyproject.toml|requirements*.txt|requirements*.in|setup.py|setup.cfg|Dockerfile*|scripts/bootstrap*|scripts/install*)
-                    has_high_risk="true"
-                    ;;
-                esac
+              if [[ "$is_fork" == "true" ]] && is_high_risk "$path"; then
+                has_high_risk="true"
               fi
             done
             if [[ "$has_python" == "false" && "$has_contract" == "false" \
                   && "$has_native" == "false" && "$has_high_risk" == "false" ]]; then
               skip_gpu_smoke="true"
+              scope="skip"
+              pytest_targets=""
+              full_tier_targets=""
               reason="No Python, manifest or native source files changed; GPU smoke skipped."
-              {
-                echo "skip_gpu_smoke=$skip_gpu_smoke"
-                echo "is_fork=$is_fork"
-                echo "allow_fast_path=$allow_fast_path"
-                echo "scope=skip"
-                echo "pytest_targets="
-                echo "full_tier_targets="
-                echo "reason=$reason"
-              } >> "$GITHUB_OUTPUT"
+              write_outputs
               exit 0
             fi
             if [[ "$has_python" == "false" && "$has_high_risk" == "true" ]]; then
-              # Fork PR changed high-risk build/infra files but no Python.
-              # Run full GPU smoke to validate the environment is not broken.
-              skip_gpu_smoke="false"
-              allow_fast_path="false"
-              scope="full-smoke"
-              pytest_targets="tests"
+              # Fork PR changed high-risk build/infra files but no Python:
+              # run full GPU smoke to validate the environment is not broken.
               reason="Fork PR changed high-risk file(s) without Python changes; running full GPU smoke."
-              {
-                echo "skip_gpu_smoke=$skip_gpu_smoke"
-                echo "is_fork=$is_fork"
-                echo "allow_fast_path=$allow_fast_path"
-                echo "scope=$scope"
-                echo "pytest_targets=$pytest_targets"
-                echo "full_tier_targets=$full_tier_targets"
-                echo "reason=$reason"
-              } >> "$GITHUB_OUTPUT"
+              write_outputs
               exit 0
             fi
 
@@ -331,19 +328,10 @@ jobs:
             selected_targets=()
 
             for path in "${changed_files[@]}"; do
-              if [[ "$is_fork" == "true" ]]; then
-                case "$path" in
-                  .github/ISSUE_TEMPLATE/*|.github/pull_request_template.md|src/tileops/_ops/*.py|tests/ops/test_*.py|tests/ops/*/test_*.py|*.md)
-                    ;;
-                  .github/workflows/*|pyproject.toml|requirements*.txt|requirements*.in|setup.py|setup.cfg|Dockerfile*|scripts/bootstrap*|scripts/install*)
-                    allow_fast_path="false"
-                    reason="Fork PR changed a high-risk file: $path"
-                    ;;
-                  *)
-                    allow_fast_path="false"
-                    reason="Fork PR changed a file outside the future fast-path policy: $path"
-                    ;;
-                esac
+              # A fork PR's other files outside the skip list below fall back to full smoke anyway.
+              if [[ "$is_fork" == "true" ]] && is_high_risk "$path"; then
+                allow_fast_path="false"
+                reason="Fork PR changed a high-risk file: $path"
               fi
 
               case "$path" in
@@ -368,31 +356,15 @@ jobs:
               esac
             done
 
-            if [[ "$scope" == "skip" ]]; then
-              if [[ "$allow_fast_path" == "true" ]]; then
-                # All changed files matched docs/metadata patterns; skip GPU smoke
-                # for both trusted and fork PRs.
-                skip_gpu_smoke="true"
-                pytest_targets=""
-                reason="Docs-only or metadata-only change; GPU smoke skipped."
-              elif [[ "$is_fork" == "true" ]]; then
-                scope="full-smoke"
-                pytest_targets="tests"
-                reason="${reason}; current policy still runs GPU smoke."
-              else
-                skip_gpu_smoke="true"
-                pytest_targets=""
-                reason="Docs-only or metadata-only change; GPU smoke skipped."
-              fi
-            elif [[ "$scope" == "targeted" ]]; then
+            if [[ "$scope" == "targeted" ]]; then
               if [[ "${#selected_targets[@]}" -eq 0 ]]; then
                 scope="full-smoke"
                 pytest_targets="tests"
                 reason="No mapped tests were collected; falling back to full smoke."
               else
                 pytest_targets="${selected_targets[*]}"
-                if [[ "$is_fork" == "true" && "$allow_fast_path" != "true" ]]; then
-                  reason="${reason}; current policy still runs targeted GPU smoke."
+                if [[ "$allow_fast_path" == "false" ]]; then
+                  reason="${reason}; running targeted GPU smoke."
                 else
                   reason="Running targeted GPU smoke tests."
                 fi
@@ -400,15 +372,7 @@ jobs:
             fi
           fi
 
-          {
-            echo "is_fork=$is_fork"
-            echo "allow_fast_path=$allow_fast_path"
-            echo "skip_gpu_smoke=$skip_gpu_smoke"
-            echo "scope=$scope"
-            echo "pytest_targets=$pytest_targets"
-            echo "full_tier_targets=$full_tier_targets"
-            echo "reason=$reason"
-          } >> "$GITHUB_OUTPUT"
+          write_outputs
 
   gpu-smoke:
     needs: [ci-prereq, security-policy]
@@ -483,46 +447,8 @@ jobs:
 
       - name: Validate GPU frequency
         run: |
-          set -euo pipefail
-          TARGET_CLOCK_MHZ=1500
-          RETRIES=5
-          SLEEP_SECONDS=2
-
-          if ! command -v nvidia-smi >/dev/null 2>&1; then
-            echo "::error::nvidia-smi is not available on this runner."
-            exit 1
-          fi
-
-          echo "Detected GPUs:"
           nvidia-smi -L
-
-          attempt=1
-          while [ "$attempt" -le "$RETRIES" ]; do
-            echo "Validation attempt ${attempt}/${RETRIES}"
-            mismatch=0
-            while IFS=',' read -r gpu_index gpu_name gpu_clock; do
-              gpu_index="$(echo "$gpu_index" | xargs)"
-              gpu_name="$(echo "$gpu_name" | xargs)"
-              gpu_clock="$(echo "$gpu_clock" | xargs)"
-              echo "GPU ${gpu_index} (${gpu_name}) clock: ${gpu_clock} MHz"
-              if [[ "$gpu_clock" != "$TARGET_CLOCK_MHZ" ]]; then
-                mismatch=1
-              fi
-            done < <(nvidia-smi --query-gpu=index,name,clocks.current.graphics --format=csv,noheader,nounits)
-
-            if [[ "$mismatch" -eq 0 ]]; then
-              echo "All GPUs locked at ${TARGET_CLOCK_MHZ} MHz."
-              break
-            fi
-
-            if [[ "$attempt" -eq "$RETRIES" ]]; then
-              echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz on all GPUs."
-              exit 1
-            fi
-
-            sleep "$SLEEP_SECONDS"
-            attempt=$((attempt + 1))
-          done
+          bash scripts/ci/check_gpu_clock.sh
 
       - name: Install TileOPs (image-baked stack, --no-deps)
         # tilelang + the full runtime/dev stack are baked into the runner image; this installs
@@ -538,11 +464,6 @@ jobs:
           FULL_TIER_TARGETS: ${{ needs.security-policy.outputs.full_tier_targets }}
         run: |
           set -euo pipefail
-          # Per-test hang guard: a stuck kernel (e.g. a cold-compile loop or a spinning CUDA
-          # call) fails as a timeout with a thread dump instead of wedging the job. --no-deps
-          # tileops install doesn't bring this; pin via constraints.txt so the install is
-          # deterministic (the runner image should bake it and drop this install — follow-up).
-          python3 -m pip install -q -c constraints.txt pytest-timeout pytest-xdist
           # Eight workers share the job's one GPU. `loadfile` keeps a file on one worker: some
           # files assert over what their other cases recorded in the process.
           XDIST=(-n 8 --dist loadfile)

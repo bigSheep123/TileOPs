@@ -21,7 +21,7 @@ from benchmarks.baselines import (
     flaggems_dims,
     flaggems_op,
 )
-from tileops._ops.reduction.reduce import (
+from tileops.reduction import (
     AmaxFwdOp,
     AminFwdOp,
     MeanFwdOp,

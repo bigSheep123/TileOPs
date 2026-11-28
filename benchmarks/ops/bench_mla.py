@@ -14,6 +14,8 @@ from benchmarks.baselines import (
     backward_of,
     baseline_module,
     flashinfer_op,
+    flashinfer_paged_kv,
+    flashinfer_workspace,
     optional_baseline,
     vllm_op,
 )
@@ -36,7 +38,7 @@ def test_mla_decode_bench(case) -> None:
     indices = torch.arange(batch * pages, dtype=torch.int32, device=q.device)
     lengths = torch.full((batch,), length, dtype=torch.int32, device=q.device)
     wrapper_cls = flashinfer_op("mla.BatchMLAPagedAttentionWrapper")
-    wrapper = wrapper_cls(torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=q.device))
+    wrapper = wrapper_cls(flashinfer_workspace(q.device))
     wrapper.plan(
         torch.arange(batch + 1, dtype=torch.int32, device=q.device),
         torch.arange(batch + 1, dtype=torch.int32, device=q.device) * pages,
@@ -101,14 +103,8 @@ def _flashinfer_paged(inputs, op):
     q, kv_cache, table, lens, kv_scale = inputs
     batch, s_q, heads, dim = q.shape
     dim_v, page = op.kv_lora_rank, kv_cache.shape[1]
-    reach = [-(-int(n) // page) for n in lens.tolist()]
-    indices = torch.cat([table[b, : reach[b]] for b in range(batch)])
-    indptr = torch.tensor(
-        [0, *torch.tensor(reach).cumsum(0).tolist()], dtype=torch.int32, device=q.device
-    )
-    wrapper = flashinfer_op("mla.BatchMLAPagedAttentionWrapper")(
-        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=q.device)
-    )
+    indptr, indices, _ = flashinfer_paged_kv(table, lens, page)
+    wrapper = flashinfer_op("mla.BatchMLAPagedAttentionWrapper")(flashinfer_workspace(q.device))
     scale = dim**-0.5 if op.sm_scale is None else op.sm_scale
     wrapper.plan(
         torch.arange(batch + 1, dtype=torch.int32, device=q.device) * s_q, indptr, indices,
@@ -181,7 +177,7 @@ def test_mla_varlen_fwd_bench(case) -> None:
         return out, lse
 
     wrapper = flashinfer_op("prefill.BatchPrefillWithRaggedKVCacheWrapper")(
-        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=q.device), kv_layout="NHD"
+        flashinfer_workspace(q.device), kv_layout="NHD"
     )
     wrapper.plan(
         qo_indptr=cu_seqlens,

@@ -126,13 +126,20 @@ def testcase_fields(tc: ET.Element, props: dict[str, str]) -> dict:
     else:
         outcome = "passed"
     reported = failure if failure is not None else error
+    message = None
+    if reported is not None:
+        # An empty message attribute falls back to the first line of the element's text.
+        message = (reported.attrib.get("message") or "").strip()
+        if not message:
+            text_lines = (reported.text or "").strip().splitlines()
+            message = text_lines[0].strip() if text_lines else ""
     return {
         "nodeid": f"{tc.attrib.get('classname', '')}::{tc.attrib.get('name', '')}",
         "name": tc.attrib.get("name", ""),
         "outcome": outcome,
         "op": props.get("op"),
         "op_module": props.get("op_module"),
-        "failure_message": reported.attrib.get("message", "") if reported is not None else None,
+        "failure_message": message,
     }
 
 
@@ -291,8 +298,11 @@ def aggregate_model_results(results: list[dict]) -> dict[str, dict]:
 
 def _table_cell(text: str) -> str:
     """``text`` as one markdown table cell: whitespace runs, newlines among them, become one
-    space, pipes are escaped, and at most 120 characters remain."""
-    return " ".join(text.split()).replace("|", "\\|")[:120]
+    space, text past 160 characters is cut to end in "...", and pipes are escaped."""
+    text = " ".join(text.split())
+    if len(text) > 160:
+        text = text[:157] + "..."
+    return text.replace("|", "\\|")
 
 
 def _throughput_section(throughput: dict[str, dict], models: dict[str, dict] | None) -> list[str]:

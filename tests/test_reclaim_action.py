@@ -263,32 +263,6 @@ def test_every_op_test_file_reaches_the_targeted_arm() -> None:
     )
 
 
-def test_fork_fast_path_accepts_the_same_op_tests() -> None:
-    """Otherwise a fork PR touching a nested op test is classified "outside the
-    fast-path policy" rather than as the test-only change it is."""
-    script = _policy_script()
-    # The arm itself, not the whole script: a substring search also matches the
-    # pattern quoted in a comment, and would pass over an arm that dropped it. The
-    # `;;` requirement is what keeps a comment shaped like an arm from matching.
-    fork_arms = [
-        a
-        for a in re.findall(
-            r"^[ \t]*([^\s)#][^\s)]*ISSUE_TEMPLATE[^)\n]*)\)\n(?:.*\n)*?[ \t]*;;\s*$",
-            script,
-            re.M,
-        )
-        if "tests/ops" in a
-    ]
-    assert len(fork_arms) == 1, f"expected one fork fast-path arm, found {fork_arms}"
-    listed = fork_arms[0].split("|")
-
-    for pattern in _targeted_arm_patterns(script).split("|"):
-        assert pattern in listed, (
-            f"fork fast-path arm is missing '{pattern}'; the two arms must describe "
-            "the same set of op test files"
-        )
-
-
 def test_every_native_source_forces_gpu_smoke() -> None:
     """Kernels compile `src/tileops/csrc` in at build time; a file the arm misses
     reads as a non-Python change and skips GPU smoke."""

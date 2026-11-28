@@ -16,8 +16,8 @@ import triton.language as tl
 from benchmarks import api as bench
 from benchmarks.baselines import VLLM_TAG, vllm_op
 from tileops._kernels.constants import MAX_BLOCK_THREADS
-from tileops._ops.moe import MoEPermuteAlignFwdOp
 from tileops._utils import WARP_LANES
+from tileops.moe import MoEPermuteAlignFwdOp
 
 
 @triton.jit

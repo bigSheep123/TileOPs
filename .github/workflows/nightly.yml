@@ -150,11 +150,6 @@ jobs:
           # kill costs only that file's results. py-spy captures the stack of
           # a hung child before the runner kills it.
           # Bound stalled cases separately from the total sweep budget.
-          set -o pipefail
-          # Best-effort: on a network failure the run proceeds without stack
-          # dumps (the runner records the absence) instead of dying here.
-          python3 -m pip install -q -c constraints.txt py-spy \
-            || echo "::warning::py-spy install failed; hang stack dumps disabled"
           python3 scripts/ci/run_benchmarks.py benchmarks/ops \
             --junit-xml bench_results.xml \
             --stall-timeout 900 \
@@ -285,7 +280,6 @@ jobs:
           echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
           echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
-          python3 -m pip install -q -c constraints.txt pytest-timeout pytest-cov
           # Coverage reflects the full/nightly tiers only. Smoke-only cases run in
           # gpu-smoke.yml and their code reads as untested here.
           # tests/models runs in the model-test job.
@@ -335,7 +329,6 @@ jobs:
         run: |
           set -euo pipefail
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
-          python3 -m pip install -q -c constraints.txt pytest-timeout
           python3 -m pytest tests/models -m nightly -v --tb=short --timeout=900 --timeout-method=thread --junit-xml=model_test_results.xml | tee tileops_model_test.log
         shell: bash
 

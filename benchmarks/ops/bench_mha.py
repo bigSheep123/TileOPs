@@ -1,10 +1,14 @@
 """Benchmarks for multi-head attention paged decode, one case per manifest call, against FA3 and FlashInfer."""
 
 import pytest
-import torch
 
 from benchmarks import api as bench
-from benchmarks.baselines import FLASHINFER_TAG, optional_baseline
+from benchmarks.baselines import (
+    FLASHINFER_TAG,
+    flashinfer_paged_kv,
+    flashinfer_workspace,
+    optional_baseline,
+)
 from tileops.attention import MHAPagedFwdOp
 
 
@@ -55,26 +59,15 @@ def _flashinfer_mha_decode_paged(workload, q, k, v, block_table, cache_seqlens):
     if BatchDecodeWithPagedKVCacheWrapper is None:
         return None
 
-    batch = q.shape[0]
     num_pages = k.shape[0] // workload.page_size
     k_paged = k.view(num_pages, workload.page_size, workload.heads, workload.dim)
     v_paged = v.view(num_pages, workload.page_size, workload.heads, workload.dim)
     kv_data = (k_paged, v_paged)
 
-    pages_per_batch = (cache_seqlens.int() + workload.page_size - 1) // workload.page_size
-    indptr = torch.zeros(batch + 1, dtype=torch.int32, device=q.device)
-    indptr[1:] = torch.cumsum(pages_per_batch, dim=0)
-
-    indices_list = []
-    for b in range(batch):
-        n = pages_per_batch[b].item()
-        indices_list.append(block_table[b, :n])
-    indices = torch.cat(indices_list)
-
-    last_page_len = (cache_seqlens.int() - 1) % workload.page_size + 1
-
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=q.device)
-    wrapper = BatchDecodeWithPagedKVCacheWrapper(workspace, kv_layout="NHD")
+    indptr, indices, last_page_len = flashinfer_paged_kv(
+        block_table, cache_seqlens, workload.page_size
+    )
+    wrapper = BatchDecodeWithPagedKVCacheWrapper(flashinfer_workspace(q.device), kv_layout="NHD")
     wrapper.plan(
         indptr=indptr,
         indices=indices,

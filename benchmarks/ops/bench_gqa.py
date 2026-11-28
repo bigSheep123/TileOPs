@@ -15,6 +15,8 @@ from benchmarks.baselines import (
     baseline_module,
     compiled_reference,
     flashinfer_op,
+    flashinfer_paged_kv,
+    flashinfer_workspace,
     optional_baseline,
     vllm_op,
 )
@@ -184,8 +186,9 @@ def _flashinfer_gqa_dense_decode(
     indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=q.device) * pages_per_seq
     indices = torch.arange(total_pages, dtype=torch.int32, device=q.device)
     last_page_len = torch.full((batch,), page_size, dtype=torch.int32, device=q.device)
-    workspace = torch.empty(1024 * 1024 * 1024, dtype=torch.uint8, device=q.device)
-    wrapper = BatchDecodeWithPagedKVCacheWrapper(workspace, kv_layout="NHD", use_tensor_cores=True)
+    wrapper = BatchDecodeWithPagedKVCacheWrapper(
+        flashinfer_workspace(q.device, mib=1024), kv_layout="NHD", use_tensor_cores=True
+    )
     wrapper.plan(
         indptr=indptr,
         indices=indices,
@@ -337,9 +340,8 @@ def _flashinfer_gqa_dense_sinks(workload, inputs):
     ):
         return None
     q, k = inputs[:2]
-    workspace = torch.empty(128 * 1024 * 1024, device=q.device, dtype=torch.uint8)
     wrapper = flashinfer_op("BatchAttentionWithAttentionSinkWrapper")(
-        workspace,
+        flashinfer_workspace(q.device),
         kv_layout="NHD",
         backend="fa3",
         q_data_type=q.dtype,
@@ -544,9 +546,8 @@ def _flashinfer_gqa_varlen(
     if workload.has_sinks:
         return _flashinfer_varlen_sinks(workload, inputs, rotate)
     q, _k, _v, cu_seqlens_q, cu_seqlens_kv = inputs[:5]
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=q.device)
     wrapper = flashinfer_op("prefill.BatchPrefillWithRaggedKVCacheWrapper")(
-        workspace, kv_layout="NHD"
+        flashinfer_workspace(q.device), kv_layout="NHD"
     )
     wrapper.plan(
         qo_indptr=cu_seqlens_q,
@@ -576,9 +577,8 @@ def _flashinfer_varlen_sinks(workload, inputs, rotate):
     if workload.softcap or workload.dtype == torch.float8_e4m3fn:
         return None
     q, k, _v, cu_q, cu_kv = inputs[:5]
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=q.device)
     wrapper = flashinfer_op("attention.BatchAttentionWithAttentionSinkWrapper")(
-        workspace,
+        flashinfer_workspace(q.device),
         kv_layout="NHD",
         q_data_type=q.dtype,
         kv_data_type=k.dtype,
@@ -807,10 +807,8 @@ def _flashinfer_gqa_paged_prefill(workload, inputs):
         return None
     q, k_pages, v_pages, page_table, cache_seqlens, cu_seqlens_q = inputs[:6]
     page_size = workload.page_size
-    pages_per_request = ((cache_seqlens + page_size - 1) // page_size).tolist()
-    indptr = torch.tensor([0, *accumulate(pages_per_request)], dtype=torch.int32, device=q.device)
-    indices = torch.cat([page_table[b, :n] for b, n in enumerate(pages_per_request)])
-    workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=q.device)
+    indptr, indices, last_page_len = flashinfer_paged_kv(page_table, cache_seqlens, page_size)
+    workspace = flashinfer_workspace(q.device, mib=256)
     if workload.has_sinks:
         if workload.softcap:
             return None  # The dedicated sink variant does not implement softcap.
@@ -831,7 +829,7 @@ def _flashinfer_gqa_paged_prefill(workload, inputs):
         qo_indptr=cu_seqlens_q,
         paged_kv_indptr=indptr,
         paged_kv_indices=indices,
-        paged_kv_last_page_len=(cache_seqlens - 1) % page_size + 1,
+        paged_kv_last_page_len=last_page_len,
         num_qo_heads=workload.heads,
         num_kv_heads=workload.heads_kv,
         head_dim_qk=workload.dim,
@@ -866,15 +864,14 @@ def _flashinfer_gqa_paged_decode(workload, inputs):
         return None
     q, k_pages, v_pages, page_table, cache_seqlens = inputs[:5]
     page_size = workload.page_size
-    pages_per_request = ((cache_seqlens + page_size - 1) // page_size).tolist()
-    indptr = torch.tensor([0, *accumulate(pages_per_request)], dtype=torch.int32, device=q.device)
-    indices = torch.cat([page_table[b, :n] for b, n in enumerate(pages_per_request)])
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=q.device)
-    wrapper = flashinfer_op("decode.BatchDecodeWithPagedKVCacheWrapper")(workspace, kv_layout="NHD")
+    indptr, indices, last_page_len = flashinfer_paged_kv(page_table, cache_seqlens, page_size)
+    wrapper = flashinfer_op("decode.BatchDecodeWithPagedKVCacheWrapper")(
+        flashinfer_workspace(q.device), kv_layout="NHD"
+    )
     wrapper.plan(
         indptr=indptr,
         indices=indices,
-        last_page_len=(cache_seqlens - 1) % page_size + 1,
+        last_page_len=last_page_len,
         num_qo_heads=workload.heads,
         num_kv_heads=workload.heads_kv,
         head_dim=workload.dim,

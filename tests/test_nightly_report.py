@@ -626,6 +626,12 @@ def test_a_benchmark_failure_message_stays_one_table_row(report):
     assert "| t[a] | AssertionError: x \\| y where z |" in md
 
 
+def test_a_long_failure_message_is_cut_to_160_characters(report):
+    failures = [{"name": "t[a]", "failure_message": "x" * 200}]
+    md = _report(report, bench_failures=failures)
+    assert f"| t[a] | {'x' * 157}... |" in md
+
+
 def test_unattributed_passes_and_failures_are_counted_and_failures_named(report):
     """A test with no op property fails the job, so the report must not lose it.
 

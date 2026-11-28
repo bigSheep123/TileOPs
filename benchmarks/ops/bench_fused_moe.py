@@ -17,7 +17,7 @@ from benchmarks.moe_baselines import (
     vllm_experts,
     vllm_router,
 )
-from tileops._ops.moe import FusedMoEFwdOp, FusedMoESharedExpertFwdOp, SharedExpertMLPFwdOp
+from tileops.moe import FusedMoEFwdOp, FusedMoESharedExpertFwdOp, SharedExpertMLPFwdOp
 
 
 def _routed_moe(op, experts):

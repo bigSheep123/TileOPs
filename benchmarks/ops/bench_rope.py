@@ -18,7 +18,7 @@ from benchmarks.baselines import (
     private_inputs,
     vllm_op,
 )
-from tileops._ops.rope import (
+from tileops.rope import (
     LongRoPEFwdOp,
     RoPECosSinFwdOp,
     RoPEFwdOp,

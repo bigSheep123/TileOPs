@@ -22,14 +22,16 @@ from benchmarks.baselines import (
     quack_op,
     vllm_op,
 )
-from tileops._ops.norm.ada_layer_norm import AdaLayerNormFwdOp
-from tileops._ops.norm.ada_layer_norm_zero import AdaLayerNormZeroFwdOp
-from tileops._ops.norm.fused_add_layer_norm import FusedAddLayerNormFwdOp
-from tileops._ops.norm.fused_add_rms_norm import FusedAddRMSNormFwdOp
-from tileops._ops.norm.fused_add_rms_norm_per_token_quant import FusedAddRMSNormPerTokenQuantFwdOp
-from tileops._ops.norm.layer_norm import LayerNormFwdOp
-from tileops._ops.norm.rms_norm import RMSNormFwdOp
-from tileops._ops.norm.rms_norm_gated import RMSNormGatedFwdOp
+from tileops.norm import (
+    AdaLayerNormFwdOp,
+    AdaLayerNormZeroFwdOp,
+    FusedAddLayerNormFwdOp,
+    FusedAddRMSNormFwdOp,
+    FusedAddRMSNormPerTokenQuantFwdOp,
+    LayerNormFwdOp,
+    RMSNormFwdOp,
+    RMSNormGatedFwdOp,
+)
 
 
 def _vllm_rms_norm(x: torch.Tensor, eps: float):

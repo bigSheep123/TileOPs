@@ -5,8 +5,7 @@ import torch
 
 from benchmarks import api as bench
 from benchmarks.baselines import TORCH_COMPILE_TAG, compiled_reference
-from tileops._ops.sequence_modeling.engram import EngramGateConvBwdOp, EngramGateConvFwdOp
-from tileops._ops.sequence_modeling.engram_decode import EngramDecodeFwdOp
+from tileops.sequence_modeling import EngramDecodeFwdOp, EngramGateConvBwdOp, EngramGateConvFwdOp
 
 
 def _bench_against_reference(op_cls, case) -> None:

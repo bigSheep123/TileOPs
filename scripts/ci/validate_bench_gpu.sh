@@ -60,15 +60,4 @@ if [ "${mem_used}" -gt "${MAX_USED_MIB}" ]; then
   exit 1
 fi
 
-TARGET_CLOCK_MHZ=1500
-RETRIES=5
-for i in $(seq 1 "${RETRIES}"); do
-  gpu_clock=$(nvidia-smi --query-gpu=clocks.current.graphics --format=csv,noheader,nounits | xargs)
-  echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
-  if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
-  if [ "${i}" -eq "${RETRIES}" ]; then
-    echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz, got ${gpu_clock} MHz."
-    exit 1
-  fi
-  sleep 2
-done
+bash "$(dirname "${BASH_SOURCE[0]}")/check_gpu_clock.sh"

@@ -29,3 +29,16 @@ def test_a_teardown_error_after_a_skip_is_a_failure(smoke_report, tmp_path):
     (result,) = smoke_report.parse_test_xml(str(xml))
     assert result["outcome"] == "failed"
     assert "| - | test_a | teardown leaked |" in smoke_report.generate_report([result], "smoke")
+
+
+def test_an_empty_failure_message_reports_the_first_text_line(smoke_report, tmp_path):
+    xml = tmp_path / "smoke.xml"
+    xml.write_text(
+        '<testsuite><testcase classname="tests.ops.test_x" name="test_a">'
+        '<failure message="">\n  AssertionError: x | y\nmore</failure>'
+        "</testcase></testsuite>"
+    )
+    (result,) = smoke_report.parse_test_xml(str(xml))
+    assert "| - | test_a | AssertionError: x \\| y |" in smoke_report.generate_report(
+        [result], "smoke"
+    )

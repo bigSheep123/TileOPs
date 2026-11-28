@@ -25,29 +25,14 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from benchmarks.hardware._common import compile_cuda
 from tileops._perf import load_profile
 
 _CU_SRC = Path(__file__).parent / "hbm_saturation.cu"
 
 
 _MIXES = ("copy", "triad", "read", "write")
-
-
-def _compile(cu_path, binary_path, arch="sm_90"):
-    """Compile the CUDA source; exit the process on failure."""
-    cmd = [
-        "nvcc",
-        "-O3",
-        f"-arch={arch}",
-        "-Wno-deprecated-gpu-targets",
-        "-o",
-        str(binary_path),
-        str(cu_path),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"nvcc compilation failed:\n{result.stderr}", file=sys.stderr)
-        sys.exit(1)
 
 
 def _run(binary_path, size_mb, theo_peak_gbs):
@@ -100,7 +85,7 @@ def main():
         binary = Path(tmpdir) / "hbm_saturation"
 
         print("Compiling hbm_saturation.cu ...")
-        _compile(_CU_SRC, binary, arch=args.arch)
+        compile_cuda(_CU_SRC, binary, arch=args.arch)
 
         print("Running benchmark (5 runs x 200 reps, this may take a few minutes) ...\n")
         lines = _run(binary, args.size_mb, theo_peak_gbs)

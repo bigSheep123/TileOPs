@@ -11,7 +11,7 @@ from benchmarks.baselines import (
     compiled_reference,
     flaggems_group_norm,
 )
-from tileops._ops.norm.group_norm import GroupNormFwdOp
+from tileops.norm import GroupNormFwdOp
 
 _CASES = bench.cases(GroupNormFwdOp)
 

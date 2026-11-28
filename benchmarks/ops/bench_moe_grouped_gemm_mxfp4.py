@@ -24,7 +24,7 @@ import torch
 
 from benchmarks import api as bench
 from benchmarks.baselines import TORCH_COMPILE_TAG, VLLM_TAG, compiled_reference, vllm_op
-from tileops._ops.moe import MoEGroupedGEMMFP8FwdOp, MoEGroupedGEMMMXFP4FwdOp
+from tileops.moe import MoEGroupedGEMMFP8FwdOp, MoEGroupedGEMMMXFP4FwdOp
 from workloads.moe import valid_rows
 
 

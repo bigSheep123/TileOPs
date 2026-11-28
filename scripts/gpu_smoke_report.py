@@ -9,47 +9,14 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from nightly_report import git_commit, testcase_fields, testcase_properties
+from nightly_report import _table_cell, git_commit, testcase_fields, testcase_properties
 
 _PASS = "\u2705"
 _FAIL = "\u274c"
 
 
-def _get_failure_reason(testcase: ET.Element) -> str:
-    failure = testcase.find("failure")
-    error = testcase.find("error")
-    node = failure if failure is not None else error
-    if node is None:
-        return ""
-
-    message = (node.attrib.get("message") or "").strip()
-    if message:
-        return message
-
-    text = (node.text or "").strip()
-    if not text:
-        return ""
-    return text.splitlines()[0].strip()
-
-
-def _truncate(text: str, limit: int = 160) -> str:
-    text = " ".join(text.split())
-    if len(text) <= limit:
-        return text
-    return text[: limit - 3] + "..."
-
-
-def _escape_markdown_cell(text: str) -> str:
-    return text.replace("|", "\\|")
-
-
 def parse_test_xml(path: str) -> list[dict]:
-    results = []
-    for testcase in ET.parse(path).iter("testcase"):
-        entry = testcase_fields(testcase, testcase_properties(testcase))
-        entry["failure_reason"] = _get_failure_reason(testcase)
-        results.append(entry)
-    return results
+    return [testcase_fields(tc, testcase_properties(tc)) for tc in ET.parse(path).iter("testcase")]
 
 
 def generate_report(results: list[dict], target: str) -> str:
@@ -60,9 +27,7 @@ def generate_report(results: list[dict], target: str) -> str:
     failed_ops = list(dict.fromkeys(result["op"] for result in failed_cases if result["op"]))
 
     correctness = f"{_PASS} Pass" if not failed_cases else f"{_FAIL} {len(failed_cases)} failed"
-    failures_ops_str = (
-        ", ".join(_escape_markdown_cell(op) for op in failed_ops) if failed_ops else "-"
-    )
+    failures_ops_str = ", ".join(failed_ops) if failed_ops else "-"
     health = _PASS if not failed_cases else _FAIL
 
     lines = [
@@ -95,10 +60,9 @@ def generate_report(results: list[dict], target: str) -> str:
             ]
         )
         for result in failed_cases:
-            op = _escape_markdown_cell(result["op"] or "-")
-            testcase = _escape_markdown_cell(result["name"] or result["nodeid"])
-            reason = _truncate(result["failure_reason"] or "No failure message available.")
-            reason = _escape_markdown_cell(reason)
+            op = result["op"] or "-"
+            testcase = (result["name"] or result["nodeid"]).replace("|", "\\|")
+            reason = _table_cell(result["failure_message"] or "No failure message available.")
             lines.append(f"| {op} | {testcase} | {reason} |")
         lines.append("")
 

@@ -13,7 +13,7 @@ from benchmarks.baselines import (
     compiled_reference,
     flaggems_op,
 )
-from tileops._ops.reduction.argreduce import ArgmaxFwdOp, ArgminFwdOp
+from tileops.reduction import ArgmaxFwdOp, ArgminFwdOp
 
 
 def _implementations(baseline_fn, flaggems_name: str, dim: int, keepdim: bool, inputs) -> dict:
