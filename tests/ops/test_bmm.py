@@ -250,9 +250,7 @@ def test_bmm_pingpong_matches_the_reference(
             False, 16, 512, 512, 1280, "bmm_persistent", marks=pytest.mark.smoke, id="persistent"
         ),
         pytest.param(True, 4, 128, 128, 128, "bmm", marks=pytest.mark.full, id="two-panels-tuned"),
-        pytest.param(
-            False, 8, 64, 1024, 4096, "bmm", marks=pytest.mark.full, id="deepseek-wo-a-64"
-        ),
+        pytest.param(False, 8, 64, 1024, 4096, "bmm", marks=pytest.mark.full, id="one-m-tile"),
         pytest.param(
             False, 8, 1024, 1024, 1024, "bmm_pingpong", marks=pytest.mark.full, id="pingpong"
         ),
@@ -321,15 +319,14 @@ def test_bmm_takes_operands_of_any_strides(batch: int, m: int, n: int, k: int):
 @pytest.mark.parametrize(
     "batch, m, n, k",
     [
-        pytest.param(1, 64, 1024, 128, marks=pytest.mark.smoke, id="m64-n1024"),
-        pytest.param(1, 64, 1032, 128, marks=pytest.mark.full, id="m64-n1032"),
-        pytest.param(1, 1, 1024, 64, marks=pytest.mark.full, id="m1-n1024"),
-        pytest.param(1, 1, 1032, 64, marks=pytest.mark.full, id="m1-n1032"),
+        pytest.param(1, 64, 1024, 128, marks=pytest.mark.smoke, id="whole-tiles"),
+        pytest.param(1, 64, 1032, 128, marks=pytest.mark.full, id="partial-n-tile"),
+        pytest.param(1, 1, 1024, 64, marks=pytest.mark.full, id="one-row"),
     ],
 )
 def test_bmm_graph_replay(batch: int, m: int, n: int, k: int) -> None:
-    """A one-batch product the size of a decode step's, of 64 rows and of one, over 1024 and
-    1032 columns."""
+    """A one-batch product on ``BMMKernel``'s 64x64x64 tiles: whole tiles over two K steps, a
+    last N tile of 8 columns, and one row of an M tile over one K step."""
     check_replay(BMMTest(batch, m, n, k, torch.bfloat16), BMMFwdOp())
 
 
@@ -339,16 +336,16 @@ def test_bmm_graph_replay(batch: int, m: int, n: int, k: int) -> None:
     "batch, m, n, k",
     [
         pytest.param(4, 128, 128, 128, marks=pytest.mark.smoke, id="two-panels"),
-        pytest.param(
-            8, 1, 1024, 64 * 512 // 8, marks=pytest.mark.full, id="deepseek-v4-flash-wo-a"
-        ),
+        pytest.param(8, 1, 1024, 4096, marks=pytest.mark.full, id="one-row"),
         pytest.param(16, 512, 512, 1280, marks=pytest.mark.full, id="persistent"),
     ],
 )
 def test_bmm_graph_replay_into_batch_strided_views(batch: int, m: int, n: int, k: int) -> None:
-    """A replay reading ``a`` and writing ``out`` as batch-strided views, as DeepSeek-V4-Flash's
-    decode step calls its grouped output projection: ``a`` the group-major view of the
-    attention output, ``out`` that of the token-major buffer ``wo_b`` reads."""
+    """A replay reading ``a`` and writing ``out`` as batch-strided views, the views
+    DeepSeek-V4-Flash's grouped output projection passes on calls of more than 64 tokens:
+    ``a`` the group-major view of the attention output, ``out`` that of the token-major buffer
+    ``wo_b`` reads. The cases reach ``BMMKernel``'s two-panel program, its 64x64x64 tiles over
+    one row of an M tile, and ``BMMPersistentKernel``."""
     test = BMMBatchStridedTest(batch, m, n, k, torch.bfloat16)
     op = BMMFwdOp()
     a, b = test.gen_inputs()

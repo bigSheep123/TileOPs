@@ -286,15 +286,15 @@ def test_sigmoid_tuned() -> None:
     [
         pytest.param(
             ReLUFwdOp,
-            64 * 1024,
+            65536,
             marks=[pytest.mark.smoke, pytest.mark.cuda_graph(op="ReLUFwdOp")],
-            id="relu-64x1024",
+            id="relu-65536",
         ),
         pytest.param(
             ReLUFwdOp,
-            64 * 1032,
+            66048,
             marks=[pytest.mark.full, pytest.mark.cuda_graph(op="ReLUFwdOp")],
-            id="relu-64x1032",
+            id="relu-66048",
         ),
         pytest.param(
             SigmoidFwdOp,
@@ -305,8 +305,9 @@ def test_sigmoid_tuned() -> None:
     ],
 )
 def test_activation_graph_replay(op_type, n_total: int) -> None:
-    """A bfloat16 activation the size of a decode step's: ReLU over 64 rows of 1024 and of 1032,
-    Sigmoid over Qwen3.8-27B's attention gate."""
+    """A bfloat16 activation. ReLU over one wave held in L2: 65536 elements take its 256-thread
+    blocks of 1024; 66048, no multiple of 1024, keep the default 128-thread blocks of 512.
+    Sigmoid over Qwen3.8-27B's decode-step attention gate."""
     check_replay(UnaryActivationTest(n_total, torch.bfloat16, op_type.__name__), op_type())
 
 
