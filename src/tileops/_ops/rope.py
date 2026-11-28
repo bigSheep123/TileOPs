@@ -100,6 +100,8 @@ class _RotaryEmbeddingOp(Op):
     rotary_dim: int
     is_neox_style: bool
     dtype: torch.dtype
+    # Rewrite the rotary columns of query and key; only RoPEFwdOp takes it as a parameter.
+    inplace: bool = False
 
     def _start(self, target: Target) -> None:
         self._freq_cache: dict[tuple, tuple] = {}
@@ -146,10 +148,21 @@ class _RotaryEmbeddingOp(Op):
         key: torch.Tensor | None,
         offsets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """``query`` and ``key`` with each token's heads rotated at its cache row."""
-        positions, query = positions.contiguous(), query.contiguous()
-        key = None if key is None else key.contiguous()
+        """``query`` and ``key`` with each token's heads rotated at its cache row; in place,
+        ``query`` and ``key`` themselves."""
+        positions = positions.contiguous()
         offsets = None if offsets is None else offsets.contiguous()
+        row_strides, callers = None, (query, key)
+        if self.inplace:
+            # A layout the kernel cannot address runs on a contiguous copy written back after, as
+            # the executor's copy of a tensor off a 16-byte boundary does.
+            query, key = (
+                t if t is None or _row_stride(t) is not None else t.contiguous() for t in callers
+            )
+            row_strides = (_row_stride(query), 0 if key is None else _row_stride(key))
+        else:
+            query = query.contiguous()
+            key = None if key is None else key.contiguous()
         cos, sin = self._tables(query.dtype, query.device)
         kernel = self.kernel_for(
             _NEOX if self.is_neox_style else _GPTJ,
@@ -162,10 +175,17 @@ class _RotaryEmbeddingOp(Op):
                 dtype=query.dtype,
                 position_dtype=positions.dtype,
                 offset_dtype=None if offsets is None else offsets.dtype,
+                row_strides=row_strides,
                 device=query.device,
             ),
         )
-        return kernel(positions, query, key, offsets, cos, sin)
+        result = kernel(positions, query, key, offsets, cos, sin)
+        if not self.inplace:
+            return result
+        for caller, written in zip(callers, (query, key), strict=True):
+            if written is not caller:
+                caller.copy_(written)
+        return callers
 
     def forward(
         self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor | None = None
@@ -180,16 +200,38 @@ class _RotaryEmbeddingOp(Op):
 
         Returns:
             ``(query_out, key_out)``, shaped as ``query`` and ``key``; ``key_out`` is None
-            where ``key`` is.
+            where ``key`` is. In place they are ``query`` and ``key``.
         """
         return self._forward(positions, query, key)
 
 
+def _row_stride(x: torch.Tensor) -> int | None:
+    """The elements from one token's row of *x* to the next, for a call that writes *x*; None
+    where its columns are not contiguous or its token dimensions do not collapse to one
+    stride."""
+    columns = x.shape[-1]
+    if columns > 1 and x.stride(-1) != 1:
+        return None
+    tokens = x.numel() // columns if columns else 0
+    # A lone row's stride is never stepped, and a row of no columns is never read.
+    if tokens <= 1:
+        return columns
+    try:
+        return x.view(tokens, columns).stride(0)
+    except RuntimeError:
+        return None
+
+
 class RoPEFwdOp(_RotaryEmbeddingOp):
-    """RoPE with standard frequencies, either rotation convention (vLLM ``RotaryEmbedding``).
+    """RoPE with standard frequencies, either rotation convention, in place when ``inplace``
+    (vLLM ``RotaryEmbedding``).
 
     ``is_neox_style`` rotates the two halves of each head's rotary columns against each
-    other; otherwise each adjacent pair rotates (GPT-J).
+    other; otherwise each adjacent pair rotates (GPT-J). ``inplace`` rewrites the rotary
+    columns of ``query`` and ``key`` and leaves the rest as they were, as
+    ``RotaryEmbedding.forward_cuda`` does. ``query`` and ``key`` may then be views of any
+    strides: rows of contiguous columns any stride apart are rewritten where they lie, and any
+    other layout is rotated on a contiguous copy that is copied back.
 
     Positions in the cache are the caller's obligation, checked only with
     ``validate_inputs=True``; unchecked, a position outside the cache reads its nearest row,
@@ -206,6 +248,7 @@ class RoPEFwdOp(_RotaryEmbeddingOp):
         dtype: torch.dtype,
         init_cache: bool = True,
         *,
+        inplace: bool = False,
         validate_inputs: bool = False,
         target: Target = None,
     ):
@@ -219,6 +262,7 @@ class RoPEFwdOp(_RotaryEmbeddingOp):
             is_neox_style: Rotate halves (NeoX) rather than adjacent pairs (GPT-J).
             dtype: The cos/sin cache's dtype, before it takes the query's.
             init_cache: Must be True: the op computes its own cache.
+            inplace: Rewrite the rotary columns of ``query`` and ``key`` and return them.
             validate_inputs: Check on the CPU that every position lies in the cache before
                 the kernels run; this synchronizes the device and cannot run inside CUDA
                 Graph capture.
@@ -232,6 +276,7 @@ class RoPEFwdOp(_RotaryEmbeddingOp):
         self.is_neox_style = is_neox_style
         self.dtype = dtype
         self.init_cache = init_cache
+        self.inplace = inplace
         self.validate_inputs = validate_inputs
         self._start(target)
 
