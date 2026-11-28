@@ -42,6 +42,31 @@ __all__ = ["GEMMFP8Block128WaveFwdKernel", "GEMMFP81D2DFwdKernel"]
 _SCALE_A_GROUPS = (16, 8, 4)
 # Buffers of the A-scale ring, so one group is written while the other is read.
 _SCALE_A_BUFFERS = 2
+# One M wave of the wave program, the rows its two consumer warpgroups cover with one 64-row
+# WGMMA each, which its fitted schedule counts tiles in.
+_WAVE_M = 128
+
+
+def _wave_scale_group(n: int, k: int, scale_b_per_row: bool) -> "int | str":
+    """The K blocks one scale staging of the wave program covers, or why it cannot address
+    ``n`` and ``k``.
+
+    TMA moves every operand, so a global row is a multiple of 16 bytes and a scale group a
+    whole number of 16-byte ``scale_a`` boxes. A group is the most that divides
+    ``ceil(k / 128)`` of eight fp32, which fill one 32-byte sector of a ``scale_a`` row, and
+    four, TMA's 16-byte unit; a per-row ``scale_b`` stages ``block_n`` rows per group, so it
+    takes four and leaves the shared memory to the operand ring.
+    """
+    scale_groups = (4,) if scale_b_per_row else (8, 4)
+    k_blocks = -(-k // 128)
+    if n % 8 != 0 or k % 16 != 0:
+        return f"the wave kernel needs n % 8 == 0 and k % 16 == 0, got n={n}, k={k}"
+    if k_blocks % min(scale_groups) != 0:
+        return (
+            f"the wave kernel needs ceil(k / 128) to be a multiple of {min(scale_groups)}, "
+            f"got {k_blocks}"
+        )
+    return next(g for g in scale_groups if k_blocks % g == 0)
 
 
 def _tma_2d(tma_dtype, data, cols, rows, row_bytes, box_cols, box_rows):
@@ -433,8 +458,7 @@ def _gemm_fp8_block128_wave_kernel(
         group_size_m, waves, prefetch_b, scales_under_wgmma, column_run, scale_span,
         k_split)`` returns the compiled ``prim_func``.
     """
-    # One M wave: the rows the two consumer warpgroups cover with one 64-row WGMMA each.
-    wave_m = 128
+    wave_m = _WAVE_M
     # Rows of one consumer warpgroup's WGMMA.
     half_m = 64
     block_k = 128
@@ -443,11 +467,6 @@ def _gemm_fp8_block128_wave_kernel(
     # The two consumer warpgroups, then the producer warpgroup.
     consumer_threads = 256
     producer_threads = 128
-    # K steps one staging of the tile's scales covers: the most that divides ``ceil(K/128)``.
-    # Eight fp32 of a ``scale_a`` row fill one 32-byte sector; four are TMA's 16-byte unit.
-    # A per-row ``scale_b`` stages ``block_n`` rows per group, so it takes the 16-byte unit
-    # and leaves the shared memory to the operand ring.
-    scale_groups = (4,) if scale_b_per_row else (8, 4)
     # Buffers of the scale ring, so one group is written while the other is read.
     scale_buffers = 2
     # A per-row ``scale_b`` is read in the fold, after the stage that gates its refill is
@@ -466,16 +485,9 @@ def _gemm_fp8_block128_wave_kernel(
 
     k_blocks = -(-k // block_k)
     scale_n = n if scale_b_per_row else -(-n // scale_block_n)
-    # TMA moves every operand: a global row must be a multiple of 16 bytes, and a scale
-    # group must be a whole number of 16-byte scale_a boxes.
-    if n % 8 != 0 or k % 16 != 0:
-        raise ValueError(f"the wave kernel needs n % 8 == 0 and k % 16 == 0, got n={n}, k={k}")
-    if k_blocks % min(scale_groups) != 0:
-        raise ValueError(
-            f"the wave kernel needs ceil(k / {block_k}) to be a multiple of "
-            f"{min(scale_groups)}, got {k_blocks}"
-        )
-    divisor_group = next(g for g in scale_groups if k_blocks % g == 0)
+    divisor_group = _wave_scale_group(n, k, scale_b_per_row)
+    if isinstance(divisor_group, str):
+        raise ValueError(divisor_group)
     # A group spanning all of K stages the tile's ``scale_a`` rows, one contiguous run of
     # fp32, as rows of ``scale_a_span`` fp32: a box of ``block_m`` rows of ``scale_group``
     # fp32 costs TMA one request per 16-byte row, longer than the tile's A and B loads.
@@ -498,8 +510,7 @@ def _gemm_fp8_block128_wave_kernel(
         k_split: int = 1,
     ) -> Callable:
         # ``scale_span`` makes one scale group span all of K, so a tile's ``scale_a`` is one
-        # contiguous run staged once a tile; otherwise a group is the largest of
-        # ``scale_groups`` that divides ``ceil(K/128)``.
+        # contiguous run staged once a tile; otherwise a group is ``_wave_scale_group``'s.
         if scale_span and scale_b_per_row:
             raise ValueError("scale_span stages 128x128 scale_b blocks only")
         scale_group = k_blocks if scale_span else divisor_group
@@ -1412,19 +1423,7 @@ class GEMMFP81D2DFwdKernel(_Block128Kernel):
     def default_config(self) -> dict:
         if self._calibrated is not None:
             return {"block_m": 128, **self._calibrated["kernel"]}
-        # A single 128-row tile splits into two 64-row ones, one consumer warpgroup each:
-        # twice the CTAs over the same N, each reading half the ``A`` rows.
-        block_m = 64 if self.m <= 128 else 128
-        m_tiles = -(-self.m // block_m)
-        target_n = self.n * m_tiles / self.sm_count
-        if target_n <= 24:
-            block_n = 16
-        elif target_n <= 48:
-            block_n = 32
-        elif target_n <= 96:
-            block_n = 64
-        else:
-            block_n = 128
+        block_m, block_n = self._analytic_tile(self.m, self.n, self.sm_count)
         return {
             "block_n": block_n,
             "num_stages": self._deepest_ring(block_m, block_n),
@@ -1432,6 +1431,22 @@ class GEMMFP81D2DFwdKernel(_Block128Kernel):
             "group_unroll": 1,
             "block_m": block_m,
         }
+
+    @staticmethod
+    def _analytic_tile(m: int, n: int, sm_count: int) -> tuple[int, int]:
+        """``(block_m, block_n)`` of a shape no board calibrated: 64 rows when one 128-row tile
+        holds ``m``, which splits it over twice the CTAs, each reading half the ``A`` rows;
+        the narrowest of 16, 32 and 64 columns whose tiles number at most 1.5 per SM, else
+        128."""
+        block_m = 64 if m <= 128 else 128
+        target_n = n * -(-m // block_m) / sm_count
+        if target_n <= 24:
+            return block_m, 16
+        if target_n <= 48:
+            return block_m, 32
+        if target_n <= 96:
+            return block_m, 64
+        return block_m, 128
 
     def _deepest_ring(self, block_m: int, block_n: int) -> int:
         """The most K-steps in flight the shared-memory budget holds, at most one tile's K-steps.
@@ -1456,13 +1471,14 @@ class GEMMFP81D2DFwdKernel(_Block128Kernel):
 
 
 class GEMMFP8Block128WaveFwdKernel(_Block128Kernel):
-    """FP8 NT GEMM for block128 scales on calibrated shapes, in tiles of 128-row waves.
+    """FP8 NT GEMM for block128 scales, in tiles of 128-row waves.
 
     ``scale_a`` is ``[M, ceil(K/128)]``; ``scale_b`` is per 128x128 block,
     ``[ceil(N/128), ceil(K/128)]``, or per 1x128 block, ``[N, ceil(K/128)]``, both
-    row-major. It serves only the shapes the device's board holds a schedule for:
+    row-major. A shape the device's board holds a schedule for runs it:
     ``_FP8_1D2D_WAVE_CONFIGS`` under 128x128 ``scale_b`` blocks,
-    ``_FP8_1D1D_WAVE_CONFIGS`` under 1x128 ones.
+    ``_FP8_1D1D_WAVE_CONFIGS`` under 1x128 ones. Any other shape under 128x128 blocks
+    runs the schedule :meth:`_fitted_schedule` derives, where it derives one.
 
     Args:
         m: Rows of ``a``.
@@ -1477,8 +1493,7 @@ class GEMMFP8Block128WaveFwdKernel(_Block128Kernel):
 
     preferred_over = frozenset({"gemm_fp8_1d2d", "gemm_fp8_block_scale"})
 
-    # Wave schedules per (m, n, k), by calibrated board; this kernel
-    # serves exactly these shapes under 128x128 ``scale_b`` blocks.
+    # Wave schedules per (m, n, k), by calibrated board, under 128x128 ``scale_b`` blocks.
     _FP8_1D2D_WAVE_CONFIGS: dict[str, dict[tuple[int, int, int], dict[str, object]]] = {
         "h200": {
             (128, 24576, 1536): {
@@ -1582,6 +1597,75 @@ class GEMMFP8Block128WaveFwdKernel(_Block128Kernel):
     }
 
     @classmethod
+    def _schedule(
+        cls, m: int, n: int, k: int, calibration: str | None, sm_count: int, per_row: bool
+    ) -> "dict[str, object] | str":
+        """The schedule of this shape, or why there is none.
+
+        A shape the board calibrated takes its calibrated schedule; any other one under
+        128x128 ``scale_b`` blocks takes :meth:`_fitted_schedule`'s.
+        """
+        configs = cls._FP8_1D1D_WAVE_CONFIGS if per_row else cls._FP8_1D2D_WAVE_CONFIGS
+        calibrated = configs.get(calibration, {}).get((m, n, k))
+        if calibrated is not None:
+            return calibrated
+        if per_row:
+            return f"has no wave config for {(m, n, k)} under 1x128 scale_b blocks on this board"
+        return cls._fitted_schedule(m, n, k, sm_count)
+
+    @staticmethod
+    def _fitted_schedule(m: int, n: int, k: int, sm_count: int) -> "dict[str, object] | str":
+        """The schedule of a shape no board calibrated, or why it has none.
+
+        Of ``tiles`` (waves, width, ring, time per output element relative to the two-wave
+        tile), the one whose rounds of ``sm_count`` tiles times elements times relative time
+        is least, on the fewest CTAs that take as many rounds, prefetching B into L2 below
+        ``prefetch_below`` K blocks. It refuses a call of at most one wave, a shape
+        ``_wave_scale_group`` refuses, and a call that one round of its tiles holds where one
+        round of the 1D2D kernel's tiles, which load fewer rows of A and B per K step, holds it
+        too.
+        """
+        prefetch_below = 16
+        tiles = ((2, 128, 3, 1.0), (1, 128, 5, 1.06), (1, 64, 8, 1.4))
+        if m <= _WAVE_M:
+            return f"m={m} fits one {_WAVE_M}-row wave; a fitted schedule serves more rows"
+        scale_group = _wave_scale_group(n, k, scale_b_per_row=False)
+        if isinstance(scale_group, str):
+            return scale_group
+
+        def rounds(block_m: int, block_n: int) -> tuple[int, int]:
+            count = -(-m // block_m) * -(-n // block_n)
+            return count, -(-count // sm_count)
+
+        def cost(tile: tuple[int, int, int, float]) -> float:
+            waves, block_n, _, relative_time = tile
+            block_m = _WAVE_M * waves
+            return rounds(block_m, block_n)[1] * block_m * block_n * relative_time
+
+        waves, block_n, ring, _ = min(tiles, key=cost)
+        count, rounds_taken = rounds(_WAVE_M * waves, block_n)
+        block_m_1d2d, block_n_1d2d = GEMMFP81D2DFwdKernel._analytic_tile(m, n, sm_count)
+        if (
+            rounds_taken == 1
+            and rounds(block_m_1d2d, block_n_1d2d)[1] == 1
+            and block_m_1d2d + block_n_1d2d < _WAVE_M * waves + block_n
+        ):
+            return (
+                f"m={m}, n={n}: one round of {block_m_1d2d}x{block_n_1d2d} 1D2D tiles, which "
+                "load fewer rows per K step, serves it"
+            )
+        return {
+            "kernel": {
+                "block_n": block_n,
+                "num_stages": min(ring, scale_group + 1),
+                "group_size_m": 8,
+                "waves": waves,
+                "prefetch_b": int(-(-k // 128) < prefetch_below),
+            },
+            "sm_count": -(-count // rounds_taken),
+        }
+
+    @classmethod
     def refusal(cls, call: GEMMFP8Call) -> "str | None":
         if cls.block_scale_grid(call) is None:
             return "requires block128 scales"
@@ -1589,9 +1673,9 @@ class GEMMFP8Block128WaveFwdKernel(_Block128Kernel):
         if reason is not None:
             return reason
         per_row = cls.block_scale_grid(call) == "1d1d"
-        configs = cls._FP8_1D1D_WAVE_CONFIGS if per_row else cls._FP8_1D2D_WAVE_CONFIGS
-        if (call.m, call.n, call.k) not in configs.get(call.calibration, {}):
-            return f"has no wave config for {(call.m, call.n, call.k)} on this board"
+        schedule = cls._schedule(call.m, call.n, call.k, call.calibration, call.sm_count, per_row)
+        if isinstance(schedule, str):
+            return schedule
         return super().refusal(call)
 
     @classmethod
@@ -1622,14 +1706,12 @@ class GEMMFP8Block128WaveFwdKernel(_Block128Kernel):
     ) -> None:
         super().__init__(m, n, k, dtype, out_dtype, device_index)
         self.scale_b_per_row = scale_b_per_row
-        calibration = self.build_target.calibration
-        configs = self._FP8_1D1D_WAVE_CONFIGS if scale_b_per_row else self._FP8_1D2D_WAVE_CONFIGS
-        self._calibrated = configs.get(calibration, {}).get((m, n, k))
-        if self._calibrated is None:
-            raise ValueError(
-                f"{type(self).__name__} has no schedule for m={m} n={n} k={k} on {calibration!r}"
-            )
-        self.sm_count = int(self._calibrated["sm_count"])
+        target = self.build_target
+        schedule = self._schedule(m, n, k, target.calibration, target.sm_count, scale_b_per_row)
+        if isinstance(schedule, str):
+            raise ValueError(f"{type(self).__name__} cannot serve m={m} n={n} k={k}: {schedule}")
+        self._schedule_of_shape = schedule
+        self.sm_count = int(schedule["sm_count"])
         self.kernel = _gemm_fp8_block128_wave_kernel(
             m, n, k, sm_count=self.sm_count, scale_b_per_row=scale_b_per_row
         )
@@ -1637,4 +1719,4 @@ class GEMMFP8Block128WaveFwdKernel(_Block128Kernel):
 
     @property
     def default_config(self) -> dict:
-        return dict(self._calibrated["kernel"])
+        return dict(self._schedule_of_shape["kernel"])

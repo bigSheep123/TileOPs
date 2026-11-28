@@ -153,6 +153,15 @@ GEMMFP8FwdOp:
   - {M: 8, N: 10240, K: 5120, SA: [8, 40], SB: [80, 40], dtype_cases: [{T: float8_e4m3fn}], label: qwen3-32b-qkv-b8}
   - {M: 16, N: 10240, K: 5120, SA: [16, 40], SB: [80, 40], dtype_cases: [{T: float8_e4m3fn}], label: qwen3-32b-qkv-b16}
   - {M: 16, N: 2112, K: 7168, SA: [16, 56], SB: [17, 56], dtype_cases: [{T: float8_e4m3fn}], label: ds-v3-qkv-a-b16}
+  # DeepSeek-V4-Flash's prefill projections at 4096 tokens, with the 128x128 weight scales
+  # its FP8 checkpoint carries.
+  - {M: 4096, N: 32768, K: 1024, SA: [4096, 8], SB: [256, 8], dtype_cases: [{T: float8_e4m3fn}], label: dsv4-flash-q-b-4k}
+  - {M: 4096, N: 4096, K: 8192, SA: [4096, 64], SB: [32, 64], dtype_cases: [{T: float8_e4m3fn}], label: dsv4-flash-o-b-4k}
+  - {M: 4096, N: 4096, K: 4096, SA: [4096, 32], SB: [32, 32], dtype_cases: [{T: float8_e4m3fn}], label: dsv4-flash-shared-w13-4k}
+  - {M: 4096, N: 4096, K: 2048, SA: [4096, 16], SB: [32, 16], dtype_cases: [{T: float8_e4m3fn}], label: dsv4-flash-shared-w2-4k}
+  - {M: 4096, N: 8192, K: 1024, SA: [4096, 8], SB: [64, 8], dtype_cases: [{T: float8_e4m3fn}], label: dsv4-flash-index-q-b-4k}
+  - {M: 4096, N: 1024, K: 4096, SA: [4096, 32], SB: [8, 32], dtype_cases: [{T: float8_e4m3fn}], label: dsv4-flash-q-a-4k}
+  - {M: 4096, N: 512, K: 4096, SA: [4096, 32], SB: [4, 32], dtype_cases: [{T: float8_e4m3fn}], label: dsv4-flash-kv-4k}
 
   roofline:
     # The contraction; two scale multiplies per result, once per tensor or once per

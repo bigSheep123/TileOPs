@@ -545,7 +545,7 @@ class GEMMFP8Fixture(FixtureBase):
                 ),
                 pytest.param(
                     512,
-                    8576,
+                    8580,
                     512,
                     torch.float8_e4m3fn,
                     "block128x128",
@@ -1275,6 +1275,27 @@ def test_gemm_fp8_1d1d_wave_matches_reference(m: int, n: int, k: int) -> None:
 )
 def test_gemm_fp8_1d2d_wave_matches_reference(m: int, n: int, k: int) -> None:
     """Per-block weight scales preserve every output on tall and wide projections."""
+    test = GEMMFP8Test(m, n, k, torch.float8_e4m3fn, "block128x128")
+    test.check(GEMMFP8FwdOp(target=BUILTIN), *test.gen_inputs())
+
+
+@pytest.mark.in_tree_kernels
+@pytest.mark.sm90
+@pytest.mark.parametrize(
+    "m, n, k",
+    [
+        pytest.param(300, 1024, 4096, marks=pytest.mark.smoke, id="64-wide-row-tail"),
+        pytest.param(512, 584, 1536, marks=pytest.mark.full, id="64-wide-column-tail-prefetch"),
+        pytest.param(400, 4096, 1024, marks=pytest.mark.full, id="one-wave-row-tail"),
+        pytest.param(400, 4104, 1024, marks=pytest.mark.full, id="one-wave-column-tail"),
+        pytest.param(1000, 8192, 1024, marks=pytest.mark.full, id="two-wave-row-tail-prefetch"),
+        pytest.param(640, 4096, 2048, marks=pytest.mark.full, id="two-wave-row-tail"),
+        pytest.param(256, 512, 7168, marks=pytest.mark.full, id="one-round-of-narrow-tiles"),
+    ],
+)
+def test_gemm_fp8_1d2d_uncalibrated_matches_reference(m: int, n: int, k: int) -> None:
+    """Block-scaled calls on shapes no board calibrated keep every output across row and column
+    tails, short and long contractions, and grids of one round."""
     test = GEMMFP8Test(m, n, k, torch.float8_e4m3fn, "block128x128")
     test.check(GEMMFP8FwdOp(target=BUILTIN), *test.gen_inputs())
 
